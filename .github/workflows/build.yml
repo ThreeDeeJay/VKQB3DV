@@ -73,5 +73,5 @@ jobs:
       shell: powershell
       run: |
         echo "VULKAN_SDK=C:\VulkanSDK\${{env.VULKAN_VERSION}}" >> $env:GITHUB_ENV
-        curl -L "https://github.com/ThreeDeeJay/VKQB3DV/releases/download/Dependencies/VulkanSDK-1.1.114-Installer.exe" -o "VulkanSDK.exe"
+        Invoke-WebRequest -Method Get -Uri "https://github.com/ThreeDeeJay/VKQB3DV/releases/download/Dependencies/VulkanSDK-1.1.114-Installer.exe" -OutFile VulkanSDK.exe -UseBasicParsing
         Start-Process -Wait ./VulkanSDK.exe -ArgumentList "/S"
