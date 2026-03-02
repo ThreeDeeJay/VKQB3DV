@@ -8,6 +8,7 @@ env:
   Configuration: Release
   Artifacts: build/Release
   Title: Vulkan Quad Buffer 3D Vision
+  VULKAN_SDK: C:\VulkanSDK\1.1.114.0
 
 on:
   push:
@@ -42,7 +43,6 @@ jobs:
       if: steps.cache-vulkan-sdk.outputs.cache-hit != 'true'
       shell: powershell
       run: |
-        echo "VULKAN_SDK=C:\VulkanSDK\1.1.114.0" >> $env:GITHUB_ENV
         Invoke-WebRequest -Method Get -Uri "https://github.com/ThreeDeeJay/VKQB3DV/releases/download/Dependencies/VulkanSDK-1.1.114-Installer.exe" -OutFile VulkanSDK.exe -UseBasicParsing
         Start-Process -Wait ./VulkanSDK.exe -ArgumentList "/S"
 
