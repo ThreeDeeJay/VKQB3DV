@@ -4,12 +4,10 @@ name: Build
 env:
   GH_TOKEN: ${{github.token}}
   Branch: ${{github.ref_name}}
-  Platform: Any CPU #Win32|x86|x64 - Check .sln file for available ones
+  Platform: x64
   Configuration: Release
   Artifacts: build/Release
-  Title: ${{github.event.repository.name}}
-  Executable: ${{github.event.repository.name}}.exe # *
-  VULKAN_VERSION: 1.1.114
+  Title: Vulkan Quad Buffer 3D Vision
 
 on:
   push:
@@ -34,44 +32,16 @@ jobs:
         echo "CommitCount=$(git rev-list --count HEAD)" >> $env:GITHUB_ENV
         echo "CommitDate=$(git show -s --date=format:'%Y-%m-%d' --format=%cd)" >> $env:GITHUB_ENV
 
-#    - name: Install Windows 8.1 SDK
-#      shell: powershell
-#      run: |
-#        Invoke-WebRequest -Method Get -Uri https://go.microsoft.com/fwlink/p/?LinkId=323507 -OutFile sdksetup.exe -UseBasicParsing
-#        Start-Process -Wait sdksetup.exe -ArgumentList "/q", "/norestart", "/features", "OptionId.WindowsDesktopSoftwareDevelopmentKit", "OptionId.NetFxSoftwareDevelopmentKit"
-
-#    - name: Install .NET Framework 4.6.1 Developer Pack
-#      shell: powershell
-#      run: |
-#        Invoke-WebRequest -Method Get -Uri https://go.microsoft.com/fwlink/?linkid=2099470 -OutFile ndp461-devpack-kb3105179-enu.exe -UseBasicParsing
-#        Start-Process -Wait ./ndp461-devpack-kb3105179-enu.exe -ArgumentList "/Quiet"
-
-#    - name: Cache DirectX SDK
-#      id: DXSDK_Jun10
-#      uses: actions/cache@v4
-#      with:
-#        path: ${{env.DXSDK_DIR}}
-#        key: DXSDK_Jun10
-#    - name: Install DirectX SDK
-#      if: steps.DXSDK_Jun10.outputs.cache-hit != 'true'
-#      shell: powershell
-#      run: |
-#        Invoke-WebRequest -Method Get -Uri https://download.microsoft.com/download/a/e/7/ae743f1f-632b-4809-87a9-aa1bb3458e31/DXSDK_Jun10.exe -OutFile DXSDK_Jun10.exe -UseBasicParsing
-#        Start-Process -Wait ./DXSDK_Jun10.exe -ArgumentList "/U"
-#    - name: Set DXSDK_DIR
-#      run: echo "DXSDK_DIR=C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\" >> $env:GITHUB_ENV
-# NOTE: STORING CACHE REQUIRES THE RUN TO SUCCEED, SO IF IT'S FAILING, TRY TEMPORARILY REMOVING ALL THE STEPS BELOW THIS LINE
-
     - name: Cache Vulkan SDK
       id: cache-vulkan-sdk
       uses: actions/cache@v5
       with:
-        path: "C:\\VulkanSDK\\${{env.VULKAN_VERSION}}"
+        path: "C:\\VulkanSDK\\1.1.114.0"
         key: VulkanSDK
     - name: Install Vulkan SDK
       if: steps.cache-vulkan-sdk.outputs.cache-hit != 'true'
       shell: powershell
       run: |
-        echo "VULKAN_SDK=C:\VulkanSDK\${{env.VULKAN_VERSION}}" >> $env:GITHUB_ENV
+        echo "VULKAN_SDK=C:\VulkanSDK\1.1.114.0" >> $env:GITHUB_ENV
         Invoke-WebRequest -Method Get -Uri "https://github.com/ThreeDeeJay/VKQB3DV/releases/download/Dependencies/VulkanSDK-1.1.114-Installer.exe" -OutFile VulkanSDK.exe -UseBasicParsing
         Start-Process -Wait ./VulkanSDK.exe -ArgumentList "/S"
