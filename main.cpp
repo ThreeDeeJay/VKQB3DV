@@ -28,7 +28,8 @@
  *
  * BUILD  (Visual Studio, from a Developer Command Prompt)
  * ────────────────────────────────────────────────────────
- *   cl /std:c++17 /W3 /O2 main.cpp /I%VULKAN_SDK%\Include ^
+ *   cl /std:c++17 /W3 /O2 /D_CRT_SECURE_NO_WARNINGS main.cpp ^
+ *      /I%VULKAN_SDK%\Include ^
  *      /link /LIBPATH:%VULKAN_SDK%\Lib vulkan-1.lib user32.lib
  *
  * BUILD  (CMake – see CMakeLists.txt)
@@ -39,6 +40,11 @@
  *  Right eye → solid RED   frame  (R=255, G=0, B=0)
  *  With 3D Vision active the glasses alternate so each eye sees its colour.
  */
+
+// ── MUST come before any Windows headers to suppress min/max macros ──────────
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#define _CRT_SECURE_NO_WARNINGS
 
 #define VK_USE_PLATFORM_WIN32_KHR
 #include <vulkan/vulkan.h>
@@ -64,6 +70,14 @@
         }                                                                      \
     } while (0)
 
+// Safe clamp that avoids the std::clamp / Windows macro conflict
+template<typename T>
+static T vk_clamp(T val, T lo, T hi) {
+    if (val < lo) return lo;
+    if (val > hi) return hi;
+    return val;
+}
+
 static void log(const char *fmt, ...) {
     char buf[512];
     va_list ap;
@@ -77,10 +91,8 @@ static void log(const char *fmt, ...) {
 
 // ─── Win32 window ───────────────────────────────────────────────────────────
 
-static HWND       s_hwnd   = nullptr;
-static bool       s_quit   = false;
-static int        s_width  = 1280;
-static int        s_height = 720;
+static HWND s_hwnd  = nullptr;
+static bool s_quit  = false;
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
@@ -88,10 +100,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CLOSE:
         s_quit = true;
         PostQuitMessage(0);
-        return 0;
-    case WM_SIZE:
-        s_width  = LOWORD(lp);
-        s_height = HIWORD(lp);
         return 0;
     }
     return DefWindowProcA(hwnd, msg, wp, lp);
@@ -139,8 +147,8 @@ struct StereoApp {
 
     // Per swapchain image: two layer views (left=0, right=1) + two framebuffers
     std::vector<VkImage>        swapImages;
-    std::vector<VkImageView>    viewLeft;   // layer 0 – cyan
-    std::vector<VkImageView>    viewRight;  // layer 1 – red
+    std::vector<VkImageView>    viewLeft;    // layer 0 – cyan
+    std::vector<VkImageView>    viewRight;   // layer 1 – red
     std::vector<VkFramebuffer>  fbLeft;
     std::vector<VkFramebuffer>  fbRight;
 
@@ -152,7 +160,7 @@ struct StereoApp {
     static const uint32_t    MAX_FRAMES   = 2;
     VkSemaphore              imageReady[MAX_FRAMES]{};
     VkSemaphore              renderDone[MAX_FRAMES]{};
-    VkFence                  inFlight[MAX_FRAMES]{};
+    VkFence                  inFlight  [MAX_FRAMES]{};
     uint32_t                 frameIndex   = 0;
 
     // ── init ──────────────────────────────────────────────────────────────
@@ -180,11 +188,8 @@ struct StereoApp {
         ai.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
         ai.apiVersion         = VK_API_VERSION_1_1;
 
-        const char *layers[] = {
-            // Enable only when available; tolerated if absent
-            "VK_LAYER_KHRONOS_validation"
-        };
-        const char *exts[] = {
+        const char *layers[] = { "VK_LAYER_KHRONOS_validation" };
+        const char *exts[]   = {
             VK_KHR_SURFACE_EXTENSION_NAME,
             VK_KHR_WIN32_SURFACE_EXTENSION_NAME
         };
@@ -233,7 +238,6 @@ struct StereoApp {
             VkPhysicalDeviceProperties props{};
             vkGetPhysicalDeviceProperties(pd, &props);
 
-            // Find a queue family that supports graphics + present
             uint32_t qfCount = 0;
             vkGetPhysicalDeviceQueueFamilyProperties(pd, &qfCount, nullptr);
             std::vector<VkQueueFamilyProperties> qf(qfCount);
@@ -249,9 +253,9 @@ struct StereoApp {
                     // ──────────────────────────────────────────────────────
                     // STEREO CHECK
                     // maxImageArrayLayers >= 2 is the necessary condition for
-                    // the 3D Vision quad-buffer stereo path on this surface.
-                    // The NVIDIA 3D Vision beta driver sets this to 2 when
-                    // stereoscopic 3D is enabled in the control panel.
+                    // the 3D Vision quad-buffer stereo path.  The NVIDIA 3D
+                    // Vision beta driver sets this to 2 when stereoscopic 3D
+                    // is enabled in the control panel.
                     // ──────────────────────────────────────────────────────
                     VkSurfaceCapabilitiesKHR caps{};
                     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(pd, surface, &caps);
@@ -259,7 +263,7 @@ struct StereoApp {
                         props.deviceName, caps.maxImageArrayLayers);
                     if (caps.maxImageArrayLayers < 2) {
                         log("WARNING: maxImageArrayLayers < 2 on this surface.");
-                        log("  -> Make sure 3D Vision is ENABLED in NVIDIA Control Panel");
+                        log("  -> Ensure 3D Vision is ENABLED in NVIDIA Control Panel");
                         log("     and you are running driver <= 426.06.");
                         log("  -> Falling back to single-layer swapchain (no stereo).");
                     }
@@ -311,30 +315,28 @@ struct StereoApp {
                 chosen = f;
         swapFmt = chosen.format;
 
-        // Present mode: prefer FIFO (vsync) for stable stereo timing
-        uint32_t pmCount = 0;
-        vkGetPhysicalDeviceSurfacePresentModesKHR(physDev, surface, &pmCount, nullptr);
-        std::vector<VkPresentModeKHR> pms(pmCount);
-        vkGetPhysicalDeviceSurfacePresentModesKHR(physDev, surface, &pmCount, pms.data());
+        // Present mode: FIFO (vsync) for stable stereo timing
         VkPresentModeKHR pm = VK_PRESENT_MODE_FIFO_KHR;
 
-        // Extent
+        // Extent – use vk_clamp to avoid the Windows min/max macro conflict
         RECT rc; GetClientRect(hwnd, &rc);
-        swapExtent.width  = std::clamp((uint32_t)(rc.right  - rc.left),
-                                       caps.minImageExtent.width,  caps.maxImageExtent.width);
-        swapExtent.height = std::clamp((uint32_t)(rc.bottom - rc.top),
-                                       caps.minImageExtent.height, caps.maxImageExtent.height);
+        uint32_t winW = (rc.right  > rc.left) ? (uint32_t)(rc.right  - rc.left) : 1u;
+        uint32_t winH = (rc.bottom > rc.top)  ? (uint32_t)(rc.bottom - rc.top)  : 1u;
 
-        uint32_t imgCount = std::max(caps.minImageCount, 3u);
-        if (caps.maxImageCount > 0) imgCount = std::min(imgCount, caps.maxImageCount);
+        swapExtent.width  = vk_clamp(winW, caps.minImageExtent.width,  caps.maxImageExtent.width);
+        swapExtent.height = vk_clamp(winH, caps.minImageExtent.height, caps.maxImageExtent.height);
+
+        uint32_t imgCount = caps.minImageCount + 1;
+        if (caps.maxImageCount > 0 && imgCount > caps.maxImageCount)
+            imgCount = caps.maxImageCount;
 
         // ──────────────────────────────────────────────────────────────────
         // KEY: imageArrayLayers = 2
         //
         // This is the entire "trick" for NVIDIA 3D Vision stereo on consumer
-        // GPUs via the 426.06 beta driver.  Layer 0 → left eye, layer 1 →
-        // right eye.  The NVIDIA driver intercepts Present() and drives the
-        // LCD shutter glasses accordingly.
+        // GPUs via the 426.06 beta driver.  Layer 0 → left eye (cyan),
+        // layer 1 → right eye (red).  The NVIDIA driver intercepts Present()
+        // and drives the LCD shutter glasses accordingly.
         //
         // The surface must report maxImageArrayLayers >= 2 (it will when
         // 3D Vision is active).  No other proprietary extension needed.
@@ -351,7 +353,7 @@ struct StereoApp {
         ci.imageFormat           = swapFmt;
         ci.imageColorSpace       = chosen.colorSpace;
         ci.imageExtent           = swapExtent;
-        ci.imageArrayLayers      = layers;          // <─── STEREO KEY
+        ci.imageArrayLayers      = layers;           // <─── STEREO KEY
         ci.imageUsage            = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
         ci.imageSharingMode      = VK_SHARING_MODE_EXCLUSIVE;
         ci.preTransform          = caps.currentTransform;
@@ -361,17 +363,15 @@ struct StereoApp {
 
         VK_CHECK(vkCreateSwapchainKHR(device, &ci, nullptr, &swapchain));
 
-        // Retrieve images
         vkGetSwapchainImagesKHR(device, swapchain, &swapImageCount, nullptr);
         swapImages.resize(swapImageCount);
         vkGetSwapchainImagesKHR(device, swapchain, &swapImageCount, swapImages.data());
 
-        // Build per-image views for layer 0 (left/cyan) and layer 1 (right/red)
         viewLeft .resize(swapImageCount, VK_NULL_HANDLE);
         viewRight.resize(swapImageCount, VK_NULL_HANDLE);
 
         for (uint32_t i = 0; i < swapImageCount; ++i) {
-            auto makeView = [&](uint32_t layer) {
+            auto makeView = [&](uint32_t layer) -> VkImageView {
                 VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
                 vi.image    = swapImages[i];
                 vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
@@ -381,7 +381,7 @@ struct StereoApp {
                 vi.subresourceRange.levelCount     = 1;
                 vi.subresourceRange.baseArrayLayer = layer; // 0=left, 1=right
                 vi.subresourceRange.layerCount     = 1;
-                VkImageView v;
+                VkImageView v = VK_NULL_HANDLE;
                 VK_CHECK(vkCreateImageView(device, &vi, nullptr, &v));
                 return v;
             };
@@ -393,7 +393,6 @@ struct StereoApp {
     // ── render pass ───────────────────────────────────────────────────────
 
     void createRenderPass() {
-        // Single colour attachment; layout transitions handled by the pass.
         VkAttachmentDescription att{};
         att.format         = swapFmt;
         att.samples        = VK_SAMPLE_COUNT_1_BIT;
@@ -411,7 +410,6 @@ struct StereoApp {
         sub.colorAttachmentCount = 1;
         sub.pColorAttachments    = &ref;
 
-        // Dependency: wait for previous present before writing colour
         VkSubpassDependency dep{};
         dep.srcSubpass    = VK_SUBPASS_EXTERNAL;
         dep.dstSubpass    = 0;
@@ -438,7 +436,7 @@ struct StereoApp {
         fbRight.resize(swapImageCount, VK_NULL_HANDLE);
 
         for (uint32_t i = 0; i < swapImageCount; ++i) {
-            auto makeFB = [&](VkImageView view) {
+            auto makeFB = [&](VkImageView view) -> VkFramebuffer {
                 VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
                 fi.renderPass      = renderPass;
                 fi.attachmentCount = 1;
@@ -446,7 +444,7 @@ struct StereoApp {
                 fi.width           = swapExtent.width;
                 fi.height          = swapExtent.height;
                 fi.layers          = 1;
-                VkFramebuffer fb;
+                VkFramebuffer fb = VK_NULL_HANDLE;
                 VK_CHECK(vkCreateFramebuffer(device, &fi, nullptr, &fb));
                 return fb;
             };
@@ -482,7 +480,7 @@ struct StereoApp {
         for (uint32_t i = 0; i < MAX_FRAMES; ++i) {
             VK_CHECK(vkCreateSemaphore(device, &si, nullptr, &imageReady[i]));
             VK_CHECK(vkCreateSemaphore(device, &si, nullptr, &renderDone[i]));
-            VK_CHECK(vkCreateFence   (device, &fi, nullptr, &inFlight[i]));
+            VK_CHECK(vkCreateFence    (device, &fi, nullptr, &inFlight  [i]));
         }
     }
 
@@ -494,31 +492,30 @@ struct StereoApp {
         VK_CHECK(vkBeginCommandBuffer(cb, &bi));
 
         VkRenderPassBeginInfo rpbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
-        rpbi.renderPass      = renderPass;
-        rpbi.renderArea      = {{0,0}, swapExtent};
+        rpbi.renderPass  = renderPass;
+        rpbi.renderArea  = {{0, 0}, swapExtent};
 
         // ── Left eye: CYAN  (R=0, G=1, B=1) ──────────────────────────────
         {
             VkClearValue cv{};
-            cv.color = {0.0f, 1.0f, 1.0f, 1.0f};  // cyan
+            cv.color.float32[0] = 0.0f;  // R
+            cv.color.float32[1] = 1.0f;  // G
+            cv.color.float32[2] = 1.0f;  // B
+            cv.color.float32[3] = 1.0f;  // A
             rpbi.framebuffer     = fbLeft[imageIndex];
             rpbi.clearValueCount = 1;
             rpbi.pClearValues    = &cv;
             vkCmdBeginRenderPass(cb, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
-            // (no draw calls – clear colour is the entire content)
+            // No draw calls – the clear colour IS the entire content
             vkCmdEndRenderPass(cb);
         }
 
         // ── Right eye: RED  (R=1, G=0, B=0) ─────────────────────────────
         //
-        // The render pass uses initialLayout=UNDEFINED for its first use,
-        // but the right-eye view is a *different* image view of the same
-        // VkImage (different baseArrayLayer), so we need to tell the driver
-        // to discard its prior contents again.  We achieve that by resetting
-        // the right-eye framebuffer's attachment to UNDEFINED before the
-        // second render pass via a pipeline barrier.
+        // The right-eye view addresses a different baseArrayLayer of the same
+        // VkImage.  We transition that layer back to UNDEFINED before the
+        // second render-pass so that loadOp=CLEAR works correctly.
         {
-            // Transition layer 1 back to UNDEFINED so loadOp=CLEAR works
             VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
             barrier.srcAccessMask       = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
             barrier.dstAccessMask       = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
@@ -535,7 +532,10 @@ struct StereoApp {
                 0, 0, nullptr, 0, nullptr, 1, &barrier);
 
             VkClearValue cv{};
-            cv.color = {1.0f, 0.0f, 0.0f, 1.0f};  // red
+            cv.color.float32[0] = 1.0f;  // R
+            cv.color.float32[1] = 0.0f;  // G
+            cv.color.float32[2] = 0.0f;  // B
+            cv.color.float32[3] = 1.0f;  // A
             rpbi.framebuffer     = fbRight[imageIndex];
             rpbi.clearValueCount = 1;
             rpbi.pClearValues    = &cv;
@@ -549,16 +549,13 @@ struct StereoApp {
     void drawFrame() {
         uint32_t fi = frameIndex % MAX_FRAMES;
 
-        // Wait for the previous frame using this slot to finish
         vkWaitForFences(device, 1, &inFlight[fi], VK_TRUE, UINT64_MAX);
 
         uint32_t imgIdx = 0;
         VkResult res = vkAcquireNextImageKHR(
             device, swapchain, UINT64_MAX, imageReady[fi], VK_NULL_HANDLE, &imgIdx);
-        if (res == VK_ERROR_OUT_OF_DATE_KHR || res == VK_SUBOPTIMAL_KHR) {
-            // Minimised or resized – skip this frame
-            return;
-        }
+        if (res == VK_ERROR_OUT_OF_DATE_KHR || res == VK_SUBOPTIMAL_KHR)
+            return; // skip minimised / resized frame
         VK_CHECK(res);
 
         vkResetFences(device, 1, &inFlight[fi]);
@@ -602,24 +599,25 @@ struct StereoApp {
         for (auto fb : fbRight)  vkDestroyFramebuffer(device, fb, nullptr);
         for (auto v  : viewLeft) vkDestroyImageView  (device, v,  nullptr);
         for (auto v  : viewRight)vkDestroyImageView  (device, v,  nullptr);
-        if (renderPass) vkDestroyRenderPass (device, renderPass, nullptr);
-        if (swapchain)  vkDestroySwapchainKHR(device, swapchain, nullptr);
-        if (device)     vkDestroyDevice     (device, nullptr);
-        if (surface)    vkDestroySurfaceKHR (instance, surface, nullptr);
-        if (instance)   vkDestroyInstance   (instance, nullptr);
+        if (renderPass) vkDestroyRenderPass  (device, renderPass, nullptr);
+        if (swapchain)  vkDestroySwapchainKHR(device, swapchain,  nullptr);
+        if (device)     vkDestroyDevice      (device, nullptr);
+        if (surface)    vkDestroySurfaceKHR  (instance, surface,  nullptr);
+        if (instance)   vkDestroyInstance    (instance, nullptr);
     }
 };
 
 // ─── entry point ─────────────────────────────────────────────────────────────
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
-    // Also attach a console for log output
+    // Attach a console for log output (freopen_s avoids the C4996 deprecation)
     AllocConsole();
-    freopen("CONOUT$", "w", stdout);
+    FILE *dummy = nullptr;
+    freopen_s(&dummy, "CONOUT$", "w", stdout);
 
     StereoApp app{};
     try {
-        s_hwnd = createWindow(hInst, s_width, s_height);
+        s_hwnd = createWindow(hInst, 1280, 720);
         app.init(hInst, s_hwnd);
 
         MSG msg{};
