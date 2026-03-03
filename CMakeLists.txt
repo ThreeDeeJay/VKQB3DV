@@ -1,6 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
 project(VulkanStereo3DVision CXX)
-
 set(CMAKE_CXX_STANDARD 17)
 
 find_package(Vulkan REQUIRED)
@@ -12,7 +11,6 @@ target_compile_definitions(VulkanStereo PRIVATE
     WIN32_LEAN_AND_MEAN
     _CRT_SECURE_NO_WARNINGS
 )
-
 target_include_directories(VulkanStereo PRIVATE ${Vulkan_INCLUDE_DIRS})
 target_link_libraries(VulkanStereo PRIVATE ${Vulkan_LIBRARIES} user32)
 
