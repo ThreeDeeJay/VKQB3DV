@@ -368,6 +368,21 @@ static PfnSetActiveEye s_fnSetActiveEye = nullptr;
 // Two-phase NVAPI init:
 //  Phase 1 (before FSE): Initialize, Enable, SetMode(MANUAL), CreateHandle.
 //  Phase 2 (after FSE):  Activate, re-probe SetActiveEye.
+// Try to set MANUAL driver mode.  Returns true if any value succeeds.
+// In v11 SetDriverMode(MANUAL=1) returned -5 (NVAPI_INVALID_ARGUMENT) on
+// both 426.06 and 452.06.  We now probe values 1, 2, 3 in case the enum
+// differs from the documented SDK value in these older driver NVAPI builds.
+// Also: call SetMode AFTER CreateHandle, which some implementations require.
+static void trySetManualMode() {
+    typedef int(*Pfn)(unsigned); auto fn=(Pfn)nvQ(NvID_Stereo_SetMode);
+    if(!fn){log("  NvAPI_Stereo_SetDriverMode fn: not found"); return;}
+    for(unsigned v : {1u, 2u, 3u}) {
+        int r=fn(v);
+        log("  NvAPI_Stereo_SetDriverMode(%u) = %d %s",v,r,r==NVAPI_OK?"(OK)":"");
+        if(r==NVAPI_OK) return;  // success – stop probing
+    }
+}
+
 static bool nvapiPhase1(IUnknown *pDev) {
     log("--- NVAPI init phase 1 (pre-FSE) ---");
     s_hNvapi=LoadLibraryA("nvapi64.dll");
@@ -383,12 +398,7 @@ static bool nvapiPhase1(IUnknown *pDev) {
     {auto fn=(PfnNvV)nvQ(NvID_Stereo_Enable);
      if(fn){int r=fn(); log("  NvAPI_Stereo_Enable = %d",r);}}
 
-    // MANUAL mode: app controls which eye is active via SetActiveEye.
-    // AUTOMATIC mode (0) is for driver-intercepted geometry pipelines, not
-    // for explicit per-eye rendering.
-    {typedef int(*Pfn)(unsigned); auto fn=(Pfn)nvQ(NvID_Stereo_SetMode);
-     if(fn){int r=fn(1); log("  NvAPI_Stereo_SetDriverMode(MANUAL=1) = %d",r);}}
-
+    // Create handle FIRST, then set mode (some drivers require this order)
     {auto fn=(PfnNvFromIUnk)nvQ(NvID_Stereo_CreateFromIUnk);
      if(fn&&pDev){
          int r=fn(pDev,&s_hStereo);
@@ -396,6 +406,9 @@ static bool nvapiPhase1(IUnknown *pDev) {
              r,r==NVAPI_OK?"OK":"FAILED",(void*)s_hStereo);
          if(r!=NVAPI_OK) s_hStereo=nullptr;
      }}
+
+    // Try MANUAL mode after handle creation
+    trySetManualMode();
 
     log("  Phase 1 complete  handle=%p",(void*)s_hStereo);
     return s_hStereo!=nullptr;
@@ -405,25 +418,28 @@ static void nvapiPhase2() {
     if(!s_hStereo){log("  nvapiPhase2: no stereo handle"); return;}
     log("--- NVAPI init phase 2 (post-FSE) ---");
 
+    // Retry MANUAL mode after FSE – some drivers only accept it once in FSE
+    trySetManualMode();
+
     {typedef int(*Pfn)(void*); auto fn=(Pfn)nvQ(NvID_Stereo_Activate);
      if(fn){int r=fn(s_hStereo); log("  NvAPI_Stereo_Activate = %d",r);}}
 
     {typedef int(*Pfn)(void*,unsigned char*); auto fn=(Pfn)nvQ(NvID_Stereo_IsActivated);
      if(fn){unsigned char a=0; fn(s_hStereo,&a);
             log("  NvAPI_Stereo_IsActivated: active=%d",(int)a);
-            if(!a) log("  WARNING: stereo still not active after FSE – check display/emitter");}}
+            if(!a) log("  (active=0 here is expected – driver commits after first Present)");}}
 
     {typedef int(*Pfn)(void*,float); auto fn=(Pfn)nvQ(NvID_Stereo_SetSeparation);
      if(fn){int r=fn(s_hStereo,50.f); log("  NvAPI_Stereo_SetSeparation(50%%) = %d",r);}}
 
     {typedef int(*Pfn)(void*,float*); auto fn=(Pfn)nvQ(NvID_Stereo_GetSeparation);
      if(fn){float sep=0.f; fn(s_hStereo,&sep);
-            log("  NvAPI_Stereo_GetSeparation = %.1f%% %s",sep,
-                sep>0.f?"(stereo live)":"(0 = stereo not live)");}}
+            log("  NvAPI_Stereo_GetSeparation = %.1f%%",sep);}}
 
-    // Probe SetActiveEye – expected to be found now that we're in FSE + MANUAL mode
+    // Initial probe – may be NOT FOUND here if driver commits lazily post-Present
     s_fnSetActiveEye=(PfnSetActiveEye)nvQ(NvID_Stereo_SetActiveEye);
-    log("  NvAPI_Stereo_SetActiveEye fn: %s",s_fnSetActiveEye?"FOUND":"NOT FOUND");
+    log("  NvAPI_Stereo_SetActiveEye (initial probe): %s",
+        s_fnSetActiveEye?"FOUND":"NOT FOUND (will re-probe each frame)");
 
     log("  Phase 2 complete");
 }
@@ -438,16 +454,17 @@ static void nvapiShutdown(){
 // ============================================================================
 static void runStereoLoop() {
     log("--- D3D11 stereo render loop (ESC to quit) ---");
-    if(!s_fnSetActiveEye){
-        log("  WARNING: SetActiveEye not found – both eyes will show same frame.");
-        log("  Rendering anyway for diagnostics (expect solid RED from last clear).");
-    } else {
-        log("  SetActiveEye found – per-eye rendering active.");
-    }
     log("  Left=CYAN  Right=RED");
+    log("  SetActiveEye initially: %s",s_fnSetActiveEye?"FOUND":"NOT FOUND (probing each frame)");
 
     typedef int(*PfnIA)(void*,unsigned char*); auto fnIA=(PfnIA)nvQ(NvID_Stereo_IsActivated);
     typedef int(*PfnGS)(void*,float*);          auto fnGS=(PfnGS)nvQ(NvID_Stereo_GetSeparation);
+    typedef int(*PfnAct)(void*);                auto fnAct=(PfnAct)nvQ(NvID_Stereo_Activate);
+
+    // Track state transitions for diagnostic logging
+    bool wasActivated   = false;
+    bool foundSetEye    = (s_fnSetActiveEye != nullptr);
+    bool loggedEyeFound = foundSetEye;
 
     uint32_t frame=0;
     MSG msg{};
@@ -458,30 +475,67 @@ static void runStereoLoop() {
         }
         if(s_quit) break;
 
-        // Left eye: CYAN
-        if(s_fnSetActiveEye) s_fnSetActiveEye(s_hStereo,NV_EYE_LEFT);
-        clearRTV(0.f,1.f,1.f);
+        // ── Deferred probe: re-check SetActiveEye every frame until found ──
+        // The driver lazily populates its dispatch table after stereo activates.
+        // In v11, activated flipped 0→1 around frame 120; probe it continuously.
+        if(!s_fnSetActiveEye){
+            s_fnSetActiveEye=(PfnSetActiveEye)nvQ(NvID_Stereo_SetActiveEye);
+            if(s_fnSetActiveEye && !loggedEyeFound){
+                log("  frame=%-6u  *** NvAPI_Stereo_SetActiveEye FOUND at frame %u! ***",
+                    frame,frame);
+                loggedEyeFound=true;
+                foundSetEye=true;
+            }
+        }
 
-        // Right eye: RED
-        if(s_fnSetActiveEye) s_fnSetActiveEye(s_hStereo,NV_EYE_RIGHT);
-        clearRTV(1.f,0.f,0.f);
+        // ── Per-eye render ──
+        if(s_fnSetActiveEye){
+            s_fnSetActiveEye(s_hStereo, NV_EYE_LEFT);
+            clearRTV(0.f,1.f,1.f);   // CYAN  – left eye
 
-        // Present with vsync=1 (required for shutter timing)
+            s_fnSetActiveEye(s_hStereo, NV_EYE_RIGHT);
+            clearRTV(1.f,0.f,0.f);   // RED   – right eye
+        } else {
+            // SetActiveEye not yet available: render CYAN only.
+            // When the driver activates stereo in auto mode, both eyes get
+            // this same frame (expected; red will appear once SetActiveEye works).
+            clearRTV(0.f,1.f,1.f);   // CYAN
+        }
+
+        // ── Present (vsync=1 required for shutter timing) ──
         HRESULT hr=dxgiPresent(1);
 
         ++frame;
 
+        // ── Check activation state; re-issue Activate if it drops ──
+        unsigned char active=0;
+        if(fnIA) fnIA(s_hStereo,&active);
+
+        if(active && !wasActivated){
+            wasActivated=true;
+            log("  frame=%-6u  *** IsActivated 0→1 (stereo committed by driver) ***",frame);
+            // Re-probe SetActiveEye immediately now that stereo is live
+            s_fnSetActiveEye=(PfnSetActiveEye)nvQ(NvID_Stereo_SetActiveEye);
+            log("  SetActiveEye after activation: %s",s_fnSetActiveEye?"FOUND":"still NOT FOUND");
+            // Retry SetDriverMode(MANUAL) now that stereo is committed
+            trySetManualMode();
+            // Re-probe SetActiveEye once more
+            s_fnSetActiveEye=(PfnSetActiveEye)nvQ(NvID_Stereo_SetActiveEye);
+            log("  SetActiveEye after MANUAL retry: %s",s_fnSetActiveEye?"FOUND":"still NOT FOUND");
+        }
+        if(!active && wasActivated){
+            wasActivated=false;
+            log("  frame=%-6u  IsActivated 1→0 (stereo dropped – re-activating)",frame);
+            if(fnAct) fnAct(s_hStereo);
+        }
+
+        // ── Periodic diagnostic ──
         if(frame==1||frame%120==0){
-            unsigned char active=0; float sep=0.f;
-            if(fnIA) fnIA(s_hStereo,&active);
+            float sep=0.f;
             if(fnGS) fnGS(s_hStereo,&sep);
-            int setL = s_fnSetActiveEye ? s_fnSetActiveEye(s_hStereo,NV_EYE_LEFT)  : -1;
-            int setR = s_fnSetActiveEye ? s_fnSetActiveEye(s_hStereo,NV_EYE_RIGHT) : -1;
-            log("  frame=%-6u  setEye(L)=%d setEye(R)=%d  present=0x%x"
-                "  activated=%d  sep=%.1f%%",
-                frame,setL,setR,(unsigned)hr,(int)active,sep);
-            // Put eyes back correctly after diagnostic probe
-            if(s_fnSetActiveEye) s_fnSetActiveEye(s_hStereo,NV_EYE_RIGHT);
+            log("  frame=%-6u  present=0x%x  activated=%d  sep=%.1f%%  setEye=%s",
+                frame,(unsigned)hr,(int)active,sep,
+                s_fnSetActiveEye?"found":"NOT FOUND");
         }
     }
     log("--- stereo loop exited after %u frames ---",frame);
@@ -707,7 +761,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int){
     AllocConsole();
     FILE *f=nullptr; freopen_s(&f,"CONOUT$","w",stdout);
     logInit();
-    log("=== VkStereo3DVision v11 startup ===");
+    log("=== VkStereo3DVision v12 startup ===");
     logDisplayMode();
 
     // Step 1: Window
