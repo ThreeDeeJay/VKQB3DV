@@ -1,61 +1,57 @@
 /*
- * vulkan_stereo_3dvision.cpp  v7
+ * vulkan_stereo_3dvision.cpp  v8
  *
  * Stereoscopic 3D – NVIDIA 3D Vision beta driver 426.06, GeForce/consumer GPU.
  *
- * ── ROOT CAUSE ───────────────────────────────────────────────────────────────
+ * ── ROOT CAUSE ANALYSIS (accumulated across v1–v7) ───────────────────────────
  *
- *  Every previous version returned VK_ERROR_INITIALIZATION_FAILED (-3) from
- *  vkCreateSwapchainKHR with imageArrayLayers=2, regardless of:
- *    - FSE mode (APPLICATION_CONTROLLED / DISALLOWED / null / ALLOWED)
- *    - whether FSE extension was on the device
- *    - present mode (IMMEDIATE / FIFO)
- *    - image count
- *    - preTransform
+ *  v7 NVAPI logs revealed two problems:
  *
- *  All Vulkan parameters were correct. The failure is pre-Vulkan: the driver's
- *  stereo swapchain path checks whether the calling PROCESS has registered with
- *  NVAPI's stereo subsystem. Without that registration, -3 is returned before
- *  any Vulkan parameters are even evaluated.
+ *  A) NvAPI_Stereo_Enable() returns OK but is insufficient.
+ *     It sets a global flag but does NOT create a per-process stereo handle.
+ *     The stereo ICD checks for a live handle bound to an active device.
+ *     Evidence: with ALLOWED/DISALLOWED, still get -3 after Enable().
+ *     With APPLICATION_CONTROLLED, the driver *partially* enters the stereo
+ *     path (different from -3 – it hard-crashes instead), confirming that
+ *     Enable() opened a door but something else is still missing.
  *
- *  The "452.06 engages 3D Vision as a side effect of D3D11 interop" observation
- *  confirms this: D3D11 initialisation internally calls NvAPI_Stereo_Enable(),
- *  which registers the process, and that is what allows imageArrayLayers=2 to
- *  succeed. Pure Vulkan applications must do this call explicitly.
+ *  B) The D3D11 stereo observation on 452.06 is the key:
+ *     D3D11 CreateDevice → NvAPI_Stereo_CreateHandleFromIUnknown(pDevice, &hStereo)
+ *     That call creates a per-device stereo handle that registers the *process*
+ *     with the 3D Vision stereo subsystem. This is what actually allows the
+ *     driver to accept an imageArrayLayers=2 Vulkan swapchain for this process.
  *
  * ── FIX ──────────────────────────────────────────────────────────────────────
  *
- *  1. Load nvapi64.dll at runtime (no NVAPI SDK required).
- *  2. Call NvAPI_Initialize()      (function ID 0x0150E828)
- *  3. Call NvAPI_Stereo_Enable()   (function ID 0x239C4545)
- *     This registers the process with the 3D Vision stereo subsystem.
- *  4. Verify with NvAPI_Stereo_IsEnabled() / NvAPI_Stereo_IsActivated().
- *  5. Then create the Vulkan stereo swapchain.
- *
- *  Additionally: try all four FSE modes in sequence for the stereo swapchain
- *  (ALLOWED → DISALLOWED → APPLICATION_CONTROLLED → null) so the correct
- *  mode is identified in a single test run.
+ *  1. Dynamically load d3d11.dll (no extra link deps) and create a minimal
+ *     D3D11 device (just enough to get an IUnknown pointer).
+ *  2. Call NvAPI_Stereo_Enable() then
+ *     NvAPI_Stereo_CreateHandleFromIUnknown(pD3D11Device, &hStereo).
+ *     This creates the per-process stereo handle the Vulkan ICD checks for.
+ *  3. Keep the Vulkan stereo swapchain creation with all FSE modes probed,
+ *     but now with the process properly registered.
+ *  4. Validation layer is disabled for the stereo Vulkan instance.
+ *     The layer wraps ICD entry points; on 426.06 the stereo check appears
+ *     to use a back-channel that bypasses the layer, but excluding it removes
+ *     any possibility of layer interference.
  *
  * ── SWAPCHAIN PATHS ──────────────────────────────────────────────────────────
  *
  *  STEREO  (maxImageArrayLayers == 2):
- *    NVAPI stereo process registration (above) → attempt swapchain creation
- *    with each FSE mode until one succeeds.  FIFO, IDENTITY, min image count.
+ *    D3D11 bootstrap + NVAPI handle creation → Vulkan swapchain probe
+ *    across all FSE modes.  FIFO, IDENTITY, min image count.
  *
  *  NON-STEREO  (maxImageArrayLayers == 1):
- *    FIFO, no FSE.  Only left-eye (cyan) pass.
+ *    No D3D11 bootstrap. Simple FIFO swapchain, validation layer ON.
  *
  * ── BUILD ────────────────────────────────────────────────────────────────────
  *   cl /std:c++17 /W3 /O2 main.cpp /I%VULKAN_SDK%\Include ^
  *      /link /LIBPATH:%VULKAN_SDK%\Lib vulkan-1.lib user32.lib
- *
- *   cmake -S . -B build -G "Visual Studio 17 2022" -A x64
- *   cmake --build build --config Release
+ *   (d3d11 loaded dynamically – no d3d11.lib needed)
  *
  * ── OUTPUT ───────────────────────────────────────────────────────────────────
  *   Left eye → CYAN (layer 0)    Right eye → RED (layer 1)
- *   Log: vulkan_stereo.log beside the exe, flushed per line.
- *   ESC to quit.
+ *   Log: vulkan_stereo.log beside the exe.   ESC to quit.
  */
 
 #define NOMINMAX
@@ -65,6 +61,7 @@
 #define VK_USE_PLATFORM_WIN32_KHR
 #include <vulkan/vulkan.h>
 #include <windows.h>
+#include <unknwn.h>     // IUnknown
 
 #include <cstdarg>
 #include <cstdio>
@@ -104,136 +101,226 @@ static void log(const char *fmt, ...) {
 static void logDisplayMode() {
     log("--- display diagnostics ---");
     DEVMODEA dm{}; dm.dmSize = sizeof(dm);
-    if (EnumDisplaySettingsA(nullptr, ENUM_CURRENT_SETTINGS, &dm)) {
+    if (EnumDisplaySettingsA(nullptr, ENUM_CURRENT_SETTINGS, &dm))
         log("  Current: %ux%u @ %u Hz  bpp=%u  flags=0x%x",
             dm.dmPelsWidth, dm.dmPelsHeight, dm.dmDisplayFrequency,
             dm.dmBitsPerPel, dm.dmDisplayFlags);
-        if (dm.dmDisplayFrequency < 120)
-            log("  WARNING: < 120 Hz. 3D Vision requires 120 Hz stereo mode.");
-    }
-    // List all 120+ Hz modes
-    bool found = false;
     for (DWORD i = 0; ; ++i) {
         DEVMODEA m{}; m.dmSize = sizeof(m);
         if (!EnumDisplaySettingsA(nullptr, i, &m)) break;
-        if (m.dmDisplayFrequency >= 120 && m.dmPelsWidth == dm.dmPelsWidth) {
-            log("  mode[%u]: %ux%u @ %u Hz  bpp=%u  flags=0x%x",
+        if (m.dmDisplayFrequency >= 120 && m.dmPelsWidth == dm.dmPelsWidth)
+            log("  mode[%u]: %ux%u @ %u Hz  bpp=%u",
                 i, m.dmPelsWidth, m.dmPelsHeight,
-                m.dmDisplayFrequency, m.dmBitsPerPel, m.dmDisplayFlags);
-            found = true;
-        }
+                m.dmDisplayFrequency, m.dmBitsPerPel);
     }
-    if (!found) log("  WARNING: no 120+ Hz mode found for current resolution.");
 }
+
+// ============================================================================
+// D3D11 bootstrap – loaded dynamically, no d3d11.lib required
+// ============================================================================
+
+// Minimal D3D11 types needed to call CreateDevice
+// (avoids needing d3d11.h / dxgi.h)
+typedef enum D3D_DRIVER_TYPE_ {
+    D3D_DRIVER_TYPE_HARDWARE = 1
+} D3D_DRIVER_TYPE_;
+typedef enum D3D_FEATURE_LEVEL_ {
+    D3D_FEATURE_LEVEL_11_0 = 0xb000
+} D3D_FEATURE_LEVEL_;
+// D3D11_SDK_VERSION is 7; passed directly as a literal below
+
+typedef HRESULT (WINAPI *PfnD3D11CreateDevice)(
+    void*,              // pAdapter
+    D3D_DRIVER_TYPE_,   // DriverType
+    HMODULE,            // Software
+    UINT,               // Flags
+    const D3D_FEATURE_LEVEL_*, // pFeatureLevels
+    UINT,               // FeatureLevels
+    UINT,               // SDKVersion
+    IUnknown**,         // ppDevice  (ID3D11Device*)
+    D3D_FEATURE_LEVEL_*, // pFeatureLevel
+    IUnknown**          // ppImmediateContext (ID3D11DeviceContext*)
+);
+
+static HMODULE   s_hD3D11  = nullptr;
+static IUnknown *s_pD3DDevice = nullptr;  // kept alive while stereo handle exists
+
+static bool d3d11Bootstrap() {
+    log("--- D3D11 bootstrap ---");
+
+    s_hD3D11 = LoadLibraryA("d3d11.dll");
+    if (!s_hD3D11) { log("  d3d11.dll: not found"); return false; }
+    log("  d3d11.dll loaded");
+
+    auto fnCreate = (PfnD3D11CreateDevice)
+        GetProcAddress(s_hD3D11, "D3D11CreateDevice");
+    if (!fnCreate) { log("  D3D11CreateDevice: not found"); return false; }
+    log("  D3D11CreateDevice: found");
+
+    D3D_FEATURE_LEVEL_ fl = D3D_FEATURE_LEVEL_11_0;
+    D3D_FEATURE_LEVEL_ flOut{};
+    IUnknown *pCtx = nullptr;
+
+    HRESULT hr = fnCreate(
+        nullptr,                 // default adapter
+        D3D_DRIVER_TYPE_HARDWARE,
+        nullptr,                 // no software rasterizer
+        0,                       // no debug flags
+        &fl, 1,                  // feature levels
+        7,                       // D3D11_SDK_VERSION
+        &s_pD3DDevice,           // out: device
+        &flOut,
+        &pCtx                    // out: immediate context (we don't need it)
+    );
+    log("  D3D11CreateDevice: hr=0x%x (%s)",
+        (unsigned)hr, SUCCEEDED(hr)?"OK":"FAILED");
+    if (pCtx) { pCtx->Release(); pCtx = nullptr; }
+    if (FAILED(hr)) { s_pD3DDevice = nullptr; return false; }
+
+    log("  D3D11 device created: %p", (void*)s_pD3DDevice);
+    return true;
+}
+
 
 // ============================================================================
 // NVAPI – loaded dynamically, no SDK required
-//
-// The NVAPI query-interface pattern: load nvapi64.dll, get nvapi_QueryInterface,
-// then retrieve individual function pointers by their stable numeric ID.
-// Function IDs are stable across all NVAPI versions.
 // ============================================================================
 
-// NVAPI status codes
-#define NVAPI_OK                   0
-#define NVAPI_ERROR               -1
-#define NVAPI_STEREO_NOT_ENABLED  -27
-
-// Function IDs
-#define NvAPI_ID_Initialize           0x0150E828u
-#define NvAPI_ID_Unload               0xD22BDD7Eu
-#define NvAPI_ID_Stereo_Enable        0x239C4545u
-#define NvAPI_ID_Stereo_IsEnabled     0xAB7C7ECBu
-#define NvAPI_ID_Stereo_IsActivated   0x1FB0BC30u
+#define NVAPI_OK   0
+#define NVAPI_ERROR (-1)
 
 typedef void *(*PfnNvApiQueryInterface)(unsigned int id);
 typedef int   (*PfnNvApiVoid)();
-typedef int   (*PfnNvApiOutBool)(unsigned char *out);
+typedef int   (*PfnNvApiFromIUnknown)(IUnknown *pDev, void **ppHandle);
+typedef int   (*PfnNvApiDestroyHandle)(void *handle);
 
-static HMODULE              s_hNvapi           = nullptr;
-static PfnNvApiQueryInterface s_nvQueryIface   = nullptr;
+static HMODULE               s_hNvapi      = nullptr;
+static PfnNvApiQueryInterface s_nvQI        = nullptr;
+static void                 *s_stereoHandle = nullptr;
 
-static void *nvQuery(unsigned int id) {
-    if (!s_nvQueryIface) return nullptr;
-    return s_nvQueryIface(id);
+static void *nvQ(unsigned int id) {
+    return s_nvQI ? s_nvQI(id) : nullptr;
 }
 
-static bool nvapiInit() {
+// Documented stable NVAPI function IDs
+// (verified against public NVAPI SDK headers nvapi.h / nvapi_lite_stereo.h)
+#define NVAPI_ID_Initialize                    0x0150E828u
+#define NVAPI_ID_Unload                        0xD22BDD7Eu
+#define NVAPI_ID_Stereo_Enable                 0x239C4545u
+#define NVAPI_ID_Stereo_SetDriverMode          0x5E8F0BECu  // 0=automatic, 1=manual
+#define NVAPI_ID_Stereo_CreateHandleFromIUnknown 0xAC7E37F4u
+#define NVAPI_ID_Stereo_DestroyHandle          0x3A153134u
+#define NVAPI_ID_Stereo_Activate               0xF6A1AD68u
+#define NVAPI_ID_Stereo_IsActivated            0x1FB0BC30u  // (StereoHandle, NvU8*)
+
+static bool nvapiInit(IUnknown *pD3DDevice) {
     log("--- NVAPI init ---");
 
     s_hNvapi = LoadLibraryA("nvapi64.dll");
-    if (!s_hNvapi) {
-        log("  LoadLibrary(nvapi64.dll): FAILED – not installed?");
-        return false;
-    }
+    if (!s_hNvapi) { log("  nvapi64.dll: not found"); return false; }
     log("  nvapi64.dll loaded");
 
-    s_nvQueryIface = (PfnNvApiQueryInterface)GetProcAddress(s_hNvapi, "nvapi_QueryInterface");
-    if (!s_nvQueryIface) {
-        log("  nvapi_QueryInterface: NOT FOUND");
-        return false;
-    }
+    s_nvQI = (PfnNvApiQueryInterface)GetProcAddress(s_hNvapi,"nvapi_QueryInterface");
+    if (!s_nvQI) { log("  nvapi_QueryInterface: not found"); return false; }
     log("  nvapi_QueryInterface: OK");
 
     // NvAPI_Initialize
-    auto fnInit = (PfnNvApiVoid)nvQuery(NvAPI_ID_Initialize);
-    if (!fnInit) { log("  NvAPI_Initialize fn: NOT FOUND"); return false; }
+    auto fnInit = (PfnNvApiVoid)nvQ(NVAPI_ID_Initialize);
+    if (!fnInit) { log("  NvAPI_Initialize: fn not found"); return false; }
     int r = fnInit();
-    log("  NvAPI_Initialize() = %d (%s)", r, r == NVAPI_OK ? "OK" : "FAILED");
+    log("  NvAPI_Initialize() = %d (%s)", r, r==NVAPI_OK?"OK":"FAILED");
     if (r != NVAPI_OK) return false;
 
-    // NvAPI_Stereo_IsEnabled (query current state before we change it)
+    // NvAPI_Stereo_Enable – global enable
     {
-        auto fn = (PfnNvApiOutBool)nvQuery(NvAPI_ID_Stereo_IsEnabled);
+        auto fn = (PfnNvApiVoid)nvQ(NVAPI_ID_Stereo_Enable);
+        log("  NvAPI_Stereo_Enable fn: %s", fn?"found":"NOT found");
         if (fn) {
-            unsigned char enabled = 0;
-            int sr = fn(&enabled);
-            log("  NvAPI_Stereo_IsEnabled() = %d  enabled=%d", sr, (int)enabled);
-            if (!enabled)
-                log("  NOTE: stereo is NOT enabled in NVAPI – will call Stereo_Enable()");
-        } else {
-            log("  NvAPI_Stereo_IsEnabled fn: not found");
+            int sr = fn();
+            log("  NvAPI_Stereo_Enable() = %d (%s)", sr, sr==NVAPI_OK?"OK":"FAILED");
         }
     }
 
-    // NvAPI_Stereo_Enable – registers THIS PROCESS with the stereo subsystem.
-    // This is the critical call that allows imageArrayLayers=2 swapchain creation.
-    // Without it the driver returns VK_ERROR_INITIALIZATION_FAILED (-3) even when
-    // 3D Vision is globally enabled in the NVIDIA Control Panel.
+    // NvAPI_Stereo_SetDriverMode(0 = AUTOMATIC)
+    // Ensures the driver uses automatic stereo detection rather than
+    // requiring explicit per-eye rendering commands.
     {
-        auto fn = (PfnNvApiVoid)nvQuery(NvAPI_ID_Stereo_Enable);
-        if (!fn) { log("  NvAPI_Stereo_Enable fn: NOT FOUND"); return false; }
-        int sr = fn();
-        log("  NvAPI_Stereo_Enable() = %d (%s)", sr, sr == NVAPI_OK ? "OK" : "FAILED");
-        if (sr != NVAPI_OK) {
-            log("  WARNING: NvAPI_Stereo_Enable failed – stereo swapchain may still fail");
-            // Don't return false; attempt Vulkan creation anyway for diagnostics
+        typedef int (*PfnSetMode)(unsigned int mode);
+        auto fn = (PfnSetMode)nvQ(NVAPI_ID_Stereo_SetDriverMode);
+        log("  NvAPI_Stereo_SetDriverMode fn: %s", fn?"found":"NOT found");
+        if (fn) {
+            int sr = fn(0); // 0 = NVAPI_STEREO_DRIVER_MODE_AUTOMATIC
+            log("  NvAPI_Stereo_SetDriverMode(AUTOMATIC) = %d (%s)",
+                sr, sr==NVAPI_OK?"OK":"FAILED");
         }
     }
 
-    // NvAPI_Stereo_IsActivated – confirms stereo is now active for this process
-    {
-        auto fn = (PfnNvApiOutBool)nvQuery(NvAPI_ID_Stereo_IsActivated);
+    // NvAPI_Stereo_CreateHandleFromIUnknown – THE critical call.
+    // Creates a per-process stereo handle bound to pD3DDevice.
+    // This is what D3D11 applications do internally; it registers the
+    // current process with the 3D Vision stereo subsystem and enables
+    // the driver to accept imageArrayLayers=2 Vulkan swapchains.
+    if (pD3DDevice) {
+        auto fn = (PfnNvApiFromIUnknown)nvQ(NVAPI_ID_Stereo_CreateHandleFromIUnknown);
+        log("  NvAPI_Stereo_CreateHandleFromIUnknown fn: %s",fn?"found":"NOT found");
+        if (fn) {
+            int sr = fn(pD3DDevice, &s_stereoHandle);
+            log("  NvAPI_Stereo_CreateHandleFromIUnknown(d3dDev) = %d (%s)  handle=%p",
+                sr, sr==NVAPI_OK?"OK":"FAILED", s_stereoHandle);
+            if (sr != NVAPI_OK || !s_stereoHandle) {
+                log("  WARNING: stereo handle creation failed – "
+                    "Vulkan stereo swapchain will likely still fail");
+            }
+        }
+    } else {
+        log("  WARNING: no D3D11 device – skipping CreateHandleFromIUnknown");
+    }
+
+    // NvAPI_Stereo_Activate – explicitly activate stereo for this handle
+    if (s_stereoHandle) {
+        typedef int (*PfnActivate)(void *handle);
+        auto fn = (PfnActivate)nvQ(NVAPI_ID_Stereo_Activate);
+        log("  NvAPI_Stereo_Activate fn: %s", fn?"found":"NOT found");
+        if (fn) {
+            int sr = fn(s_stereoHandle);
+            log("  NvAPI_Stereo_Activate(handle) = %d (%s)",
+                sr, sr==NVAPI_OK?"OK":"FAILED");
+        }
+    }
+
+    // NvAPI_Stereo_IsActivated – confirm active (needs handle + bool*)
+    if (s_stereoHandle) {
+        typedef int (*PfnIsActivated)(void *handle, unsigned char *pActive);
+        auto fn = (PfnIsActivated)nvQ(NVAPI_ID_Stereo_IsActivated);
+        log("  NvAPI_Stereo_IsActivated fn: %s", fn?"found":"NOT found");
         if (fn) {
             unsigned char active = 0;
-            int sr = fn(&active);
-            log("  NvAPI_Stereo_IsActivated() = %d  active=%d", sr, (int)active);
-            if (!active)
-                log("  NOTE: stereo not yet activated (normal before first frame)");
+            int sr = fn(s_stereoHandle, &active);
+            log("  NvAPI_Stereo_IsActivated(handle) = %d  active=%d", sr, (int)active);
         }
     }
 
-    log("  NVAPI stereo init complete");
+    log("  NVAPI init complete");
     return true;
 }
 
 static void nvapiShutdown() {
+    if (s_stereoHandle) {
+        auto fn = (PfnNvApiDestroyHandle)nvQ(NVAPI_ID_Stereo_DestroyHandle);
+        if (fn) fn(s_stereoHandle);
+        s_stereoHandle = nullptr;
+    }
     if (s_hNvapi) {
-        auto fn = (PfnNvApiVoid)nvQuery(NvAPI_ID_Unload);
+        auto fn = (PfnNvApiVoid)nvQ(NVAPI_ID_Unload);
         if (fn) fn();
         FreeLibrary(s_hNvapi);
         s_hNvapi = nullptr;
     }
+}
+
+static void d3d11Shutdown() {
+    if (s_pD3DDevice) { s_pD3DDevice->Release(); s_pD3DDevice = nullptr; }
+    if (s_hD3D11)     { FreeLibrary(s_hD3D11); s_hD3D11 = nullptr; }
 }
 
 // ============================================================================
@@ -241,7 +328,7 @@ static void nvapiShutdown() {
 // ============================================================================
 
 static const char *vkResultStr(VkResult r) {
-    switch (r) {
+    switch(r){
     case VK_SUCCESS:                     return "VK_SUCCESS";
     case VK_SUBOPTIMAL_KHR:              return "VK_SUBOPTIMAL_KHR";
     case VK_ERROR_OUT_OF_DATE_KHR:       return "VK_ERROR_OUT_OF_DATE_KHR";
@@ -257,41 +344,41 @@ static const char *vkResultStr(VkResult r) {
 #define VK_CHECK(expr)                                                         \
     do {                                                                       \
         log("  CALL  " #expr);                                                 \
-        VkResult _r = (expr);                                                  \
-        if (_r != VK_SUCCESS) {                                                \
+        VkResult _r=(expr);                                                    \
+        if(_r!=VK_SUCCESS){                                                    \
             char _b[512];                                                      \
             snprintf(_b,sizeof(_b),"FATAL %s (%d) at line %d\n" #expr,        \
                      vkResultStr(_r),(int)_r,__LINE__);                        \
             log(_b); throw std::runtime_error(_b);                             \
         }                                                                      \
         log("  OK    " #expr);                                                 \
-    } while(0)
+    }while(0)
 
-#define VK_CHECK_SWAPCHAIN(expr, out)                                          \
-    do {                                                                       \
-        (out) = (expr);                                                        \
-        if ((out) != VK_SUCCESS && (out) != VK_SUBOPTIMAL_KHR &&              \
-            (out) != VK_ERROR_OUT_OF_DATE_KHR &&                              \
-            (out) != VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) {          \
+#define VK_CHECK_SWAPCHAIN(expr,out)                                           \
+    do{                                                                        \
+        (out)=(expr);                                                          \
+        if((out)!=VK_SUCCESS&&(out)!=VK_SUBOPTIMAL_KHR&&                      \
+           (out)!=VK_ERROR_OUT_OF_DATE_KHR&&                                  \
+           (out)!=VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT){               \
             char _b[512];                                                      \
             snprintf(_b,sizeof(_b),"FATAL %s (%d) at line %d\n" #expr,        \
                      vkResultStr((VkResult)(out)),(int)(out),__LINE__);        \
             log(_b); throw std::runtime_error(_b);                             \
         }                                                                      \
-        if ((out) != VK_SUCCESS)                                               \
+        if((out)!=VK_SUCCESS)                                                  \
             log("  WARN  " #expr " -> %s",vkResultStr((VkResult)(out)));       \
-    } while(0)
+    }while(0)
 
 template<class T> static T vk_clamp(T v,T lo,T hi){return v<lo?lo:(v>hi?hi:v);}
 
-static bool hasInstanceExt(const char *n) {
+static bool hasInstanceExt(const char *n){
     uint32_t c=0; vkEnumerateInstanceExtensionProperties(nullptr,&c,nullptr);
     std::vector<VkExtensionProperties> v(c);
     vkEnumerateInstanceExtensionProperties(nullptr,&c,v.data());
     for(auto &e:v) if(!strcmp(e.extensionName,n)) return true;
     return false;
 }
-static bool hasDeviceExt(VkPhysicalDevice pd, const char *n) {
+static bool hasDeviceExt(VkPhysicalDevice pd,const char *n){
     uint32_t c=0; vkEnumerateDeviceExtensionProperties(pd,nullptr,&c,nullptr);
     std::vector<VkExtensionProperties> v(c);
     vkEnumerateDeviceExtensionProperties(pd,nullptr,&c,v.data());
@@ -306,43 +393,32 @@ static bool hasDeviceExt(VkPhysicalDevice pd, const char *n) {
 static HWND s_hwnd = nullptr;
 static bool s_quit = false;
 
-static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp) {
+static LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     if(msg==WM_DESTROY||msg==WM_CLOSE){s_quit=true;PostQuitMessage(0);return 0;}
     return DefWindowProcA(hwnd,msg,wp,lp);
 }
 
-static HWND createFullscreenWindow(HINSTANCE hInst) {
+static HWND createFullscreenWindow(HINSTANCE hInst){
     WNDCLASSEXA wc{};
     wc.cbSize=sizeof(wc); wc.style=CS_HREDRAW|CS_VREDRAW;
     wc.lpfnWndProc=WndProc; wc.hInstance=hInst;
     wc.hCursor=LoadCursorA(nullptr,IDC_ARROW);
     wc.lpszClassName="VkStereoWnd";
     RegisterClassExA(&wc);
-
-    int sw=GetSystemMetrics(SM_CXSCREEN), sh=GetSystemMetrics(SM_CYSCREEN);
-    log("Primary monitor: %dx%d", sw, sh);
-
+    int sw=GetSystemMetrics(SM_CXSCREEN),sh=GetSystemMetrics(SM_CYSCREEN);
+    log("Primary monitor: %dx%d",sw,sh);
     HWND hwnd=CreateWindowExA(0,"VkStereoWnd",
         "Vulkan 3D Vision Stereo [Left=Cyan | Right=Red]  ESC=quit",
         WS_POPUP,0,0,sw,sh,nullptr,nullptr,hInst,nullptr);
-    ShowWindow(hwnd,SW_SHOW);
-    UpdateWindow(hwnd);
-
-    // Ensure the window has foreground focus before Vulkan init.
-    // The stereo driver may check foreground ownership when setting up the
-    // stereo flip engine.
-    SetForegroundWindow(hwnd);
-    BringWindowToTop(hwnd);
-
-    // Pump messages briefly so the window is fully realised before we create
-    // the surface and swapchain.
+    ShowWindow(hwnd,SW_SHOW); UpdateWindow(hwnd);
+    SetForegroundWindow(hwnd); BringWindowToTop(hwnd);
+    // Brief message pump to fully realise the window
     MSG msg{};
     for(int i=0;i<10;++i)
         while(PeekMessageA(&msg,nullptr,0,0,PM_REMOVE)){
             TranslateMessage(&msg); DispatchMessageA(&msg);
         }
-
-    log("Window: WS_POPUP %dx%d (foreground set)", sw, sh);
+    log("Window: WS_POPUP %dx%d",sw,sh);
     return hwnd;
 }
 
@@ -397,15 +473,14 @@ struct StereoApp {
         allocateCommandBuffers();
         createSyncObjects();
         log("=== init complete: %ux%u  %u images  stereo=%s ===",
-            swapExtent.width, swapExtent.height, swapCount,
-            stereo?"YES":"NO");
+            swapExtent.width,swapExtent.height,swapCount,stereo?"YES":"NO");
     }
 
     // -----------------------------------------------------------------------
     void createInstance() {
         log("--- createInstance ---");
 
-        hasSurfaceCaps2 = hasInstanceExt(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
+        hasSurfaceCaps2=hasInstanceExt(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
         log("  VK_KHR_get_surface_capabilities2: %s",
             hasSurfaceCaps2?"available":"NOT available");
 
@@ -416,16 +491,23 @@ struct StereoApp {
         if(hasSurfaceCaps2)
             exts.push_back(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
 
-        // Validation layer – loaded if available.
-        // NOTE: if stereo still fails with validation ON, rebuild without it
-        // (remove the layer name below) to rule out layer interference.
+        // Disable the validation layer when an NVAPI stereo handle was created
+        // (i.e. when we're attempting the stereo path).
+        // The Khronos validation layer wraps every ICD entry point; on 426.06
+        // the driver's stereo path check uses a back-channel that may not
+        // function correctly when ICD calls are indirected through the layer.
+        // Disabling it removes this variable entirely for the stereo case.
+        bool wantVal = (s_stereoHandle == nullptr);
+
         const char *valLayer = "VK_LAYER_KHRONOS_validation";
         uint32_t lc=0; vkEnumerateInstanceLayerProperties(&lc,nullptr);
         std::vector<VkLayerProperties> lp(lc);
         vkEnumerateInstanceLayerProperties(&lc,lp.data());
         bool hasVal=false;
         for(auto &l:lp) if(!strcmp(l.layerName,valLayer)){hasVal=true;break;}
-        log("  Validation layer: %s", hasVal?"available":"NOT available");
+        log("  Validation layer: %s",
+            (!wantVal)?"DISABLED (stereo path)":
+            hasVal?"available":"NOT available");
 
         VkApplicationInfo ai{VK_STRUCTURE_TYPE_APPLICATION_INFO};
         ai.pApplicationName="VkStereo3DVision"; ai.apiVersion=VK_API_VERSION_1_1;
@@ -434,14 +516,15 @@ struct StereoApp {
         ci.pApplicationInfo=&ai;
         ci.enabledExtensionCount=(uint32_t)exts.size();
         ci.ppEnabledExtensionNames=exts.data();
-        if(hasVal){ci.enabledLayerCount=1;ci.ppEnabledLayerNames=&valLayer;}
+        if(wantVal&&hasVal){ci.enabledLayerCount=1;ci.ppEnabledLayerNames=&valLayer;}
 
         VK_CHECK(vkCreateInstance(&ci,nullptr,&instance));
-        log("  Instance created (validation %s)", hasVal?"ON":"OFF");
+        log("  Instance created (validation %s)",
+            (wantVal&&hasVal)?"ON":"OFF");
     }
 
     // -----------------------------------------------------------------------
-    void createSurface(HINSTANCE hInst, HWND hwnd) {
+    void createSurface(HINSTANCE hInst,HWND hwnd){
         log("--- createSurface ---");
         VkWin32SurfaceCreateInfoKHR ci{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
         ci.hinstance=hInst; ci.hwnd=hwnd;
@@ -449,11 +532,11 @@ struct StereoApp {
     }
 
     // -----------------------------------------------------------------------
-    void pickPhysicalDevice() {
+    void pickPhysicalDevice(){
         log("--- pickPhysicalDevice ---");
         uint32_t cnt=0;
         vkEnumeratePhysicalDevices(instance,&cnt,nullptr);
-        log("  Physical devices: %u", cnt);
+        log("  Physical devices: %u",cnt);
         if(!cnt) throw std::runtime_error("No Vulkan GPUs");
         std::vector<VkPhysicalDevice> devs(cnt);
         vkEnumeratePhysicalDevices(instance,&cnt,devs.data());
@@ -461,7 +544,7 @@ struct StereoApp {
         for(auto pd:devs){
             VkPhysicalDeviceProperties props{};
             vkGetPhysicalDeviceProperties(pd,&props);
-            uint32_t maj=props.driverVersion>>22, min=(props.driverVersion>>14)&0xFF;
+            uint32_t maj=props.driverVersion>>22,min=(props.driverVersion>>14)&0xFF;
             log("  GPU: %s  driver %u.%u (0x%x)",
                 props.deviceName,maj,min,props.driverVersion);
 
@@ -478,7 +561,7 @@ struct StereoApp {
 
                 VkSurfaceCapabilitiesKHR caps{};
                 vkGetPhysicalDeviceSurfaceCapabilitiesKHR(pd,surface,&caps);
-                log("  Surface: minImg=%u maxImg=%u maxArrayLayers=%u xfm=0x%x",
+                log("  Surface: min=%u max=%u maxLayers=%u xfm=0x%x",
                     caps.minImageCount,caps.maxImageCount,
                     caps.maxImageArrayLayers,(unsigned)caps.currentTransform);
 
@@ -487,18 +570,18 @@ struct StereoApp {
                 std::vector<VkSurfaceFormatKHR> fmts(fc);
                 vkGetPhysicalDeviceSurfaceFormatsKHR(pd,surface,&fc,fmts.data());
                 for(auto &f:fmts)
-                    log("  format=%d  colorSpace=%d",(int)f.format,(int)f.colorSpace);
+                    log("  fmt=%d cs=%d",(int)f.format,(int)f.colorSpace);
 
-                uint32_t pmCount=0;
-                vkGetPhysicalDeviceSurfacePresentModesKHR(pd,surface,&pmCount,nullptr);
-                std::vector<VkPresentModeKHR> pms(pmCount);
-                vkGetPhysicalDeviceSurfacePresentModesKHR(pd,surface,&pmCount,pms.data());
-                char pmBuf[128]{}; int off=0;
-                for(auto pm:pms) off+=snprintf(pmBuf+off,sizeof(pmBuf)-off,"%d ",pm);
-                log("  Present modes: [%s]", pmBuf);
+                uint32_t pmc=0;
+                vkGetPhysicalDeviceSurfacePresentModesKHR(pd,surface,&pmc,nullptr);
+                std::vector<VkPresentModeKHR> pms(pmc);
+                vkGetPhysicalDeviceSurfacePresentModesKHR(pd,surface,&pmc,pms.data());
+                char pmb[128]{}; int off=0;
+                for(auto pm:pms) off+=snprintf(pmb+off,sizeof(pmb)-off,"%d ",pm);
+                log("  PresentModes: [%s]",pmb);
 
                 stereo=(caps.maxImageArrayLayers>=2);
-                log("  Stereo: %s (maxArrayLayers=%u)",
+                log("  Stereo: %s (maxLayers=%u)",
                     stereo?"YES":"NO",caps.maxImageArrayLayers);
 
                 hasFSE=hasSurfaceCaps2&&
@@ -512,14 +595,12 @@ struct StereoApp {
     }
 
     // -----------------------------------------------------------------------
-    void createDevice() {
+    void createDevice(){
         log("--- createDevice ---");
         float prio=1.f;
         VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
         qci.queueFamilyIndex=queueFamily; qci.queueCount=1; qci.pQueuePriorities=&prio;
 
-        // Load FSE on device for BOTH paths so we can chain any FSE mode
-        // into the swapchain CI during the multi-mode probe below.
         std::vector<const char*> exts={VK_KHR_SWAPCHAIN_EXTENSION_NAME};
         if(hasFSE){
             exts.push_back(VK_EXT_FULL_SCREEN_EXCLUSIVE_EXTENSION_NAME);
@@ -535,37 +616,35 @@ struct StereoApp {
     }
 
     // -----------------------------------------------------------------------
-    // Try creating the stereo swapchain with each FSE mode in turn.
-    // This exhausts all possibilities in a single run and logs which mode
-    // (if any) the driver accepts alongside NVAPI stereo registration.
-    //
-    // Probe order rationale:
-    //   ALLOWED     – hint "FSE OK if driver wants it"; driver can use its
-    //                 internal stereo-exclusive flip path freely.
-    //   DISALLOWED  – tested in v6, failed; included for completeness.
-    //   APP_CTRL    – tested in v2 (before other fixes); may now succeed.
-    //   null/DEFAULT– tested in v3/v5, failed; retried after NVAPI fix.
-    //
+    // Probe all FSE modes for the stereo swapchain.
+    // Attempts in order, returns first success or VK_NULL_HANDLE.
     VkSwapchainKHR tryCreateStereoSwapchain(
-            VkExtent2D extent,
-            VkSurfaceFormatKHR fmt,
-            uint32_t imgCount,
-            HWND hwnd)
+            VkExtent2D extent, VkSurfaceFormatKHR fmt,
+            uint32_t imgCount, HWND hwnd)
     {
         struct Attempt {
             const char               *label;
             VkFullScreenExclusiveEXT  fseMode;
-            bool                      chainFse; // false = pNext=null
+            bool                      chainFse;
+            bool                      chainWin32; // include Win32 HMONITOR info
         };
+        // Probe order: ALLOWED first (driver uses its preferred internal path),
+        // then variants without the Win32 chain (simpler), then null pNext.
         Attempt attempts[] = {
-            { "ALLOWED",               VK_FULL_SCREEN_EXCLUSIVE_ALLOWED_EXT,               true  },
-            { "DISALLOWED",            VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT,             true  },
-            { "APPLICATION_CONTROLLED",VK_FULL_SCREEN_EXCLUSIVE_APPLICATION_CONTROLLED_EXT,true  },
-            { "null (DEFAULT)",        VK_FULL_SCREEN_EXCLUSIVE_DEFAULT_EXT,               false },
+            { "ALLOWED+Win32",     VK_FULL_SCREEN_EXCLUSIVE_ALLOWED_EXT,                true,  true  },
+            { "ALLOWED",           VK_FULL_SCREEN_EXCLUSIVE_ALLOWED_EXT,                true,  false },
+            { "DISALLOWED",        VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT,              true,  false },
+            { "APP_CTRL+Win32",    VK_FULL_SCREEN_EXCLUSIVE_APPLICATION_CONTROLLED_EXT, true,  true  },
+            { "APP_CTRL",          VK_FULL_SCREEN_EXCLUSIVE_APPLICATION_CONTROLLED_EXT, true,  false },
+            { "null",              VK_FULL_SCREEN_EXCLUSIVE_DEFAULT_EXT,                false, false },
         };
 
-        for(auto &a : attempts){
-            log("  --- stereo swapchain attempt: FSE=%s ---", a.label);
+        for(auto &a:attempts){
+            if(a.chainFse && !hasFSE){
+                log("    [%s] skipped (FSE not on device)",a.label);
+                continue;
+            }
+            log("  --- attempt: %s ---",a.label);
 
             VkSurfaceFullScreenExclusiveWin32InfoEXT fseWin32{
                 VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_WIN32_INFO_EXT};
@@ -574,14 +653,10 @@ struct StereoApp {
             VkSurfaceFullScreenExclusiveInfoEXT fseInfo{
                 VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT};
             fseInfo.fullScreenExclusive=a.fseMode;
-
-            // For ALLOWED/DISALLOWED/DEFAULT the Win32 info is optional
-            // per spec; only APPLICATION_CONTROLLED requires it. Include
-            // it for all chained cases to give the driver maximum context.
-            fseInfo.pNext=(a.chainFse && hasFSE) ? &fseWin32 : nullptr;
+            fseInfo.pNext=(a.chainFse&&a.chainWin32)?(void*)&fseWin32:nullptr;
 
             VkSwapchainCreateInfoKHR ci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
-            ci.pNext           =(a.chainFse && hasFSE) ? (void*)&fseInfo : nullptr;
+            ci.pNext           =a.chainFse?(void*)&fseInfo:nullptr;
             ci.surface          =surface;
             ci.minImageCount    =imgCount;
             ci.imageFormat      =fmt.format;
@@ -595,30 +670,33 @@ struct StereoApp {
             ci.presentMode      =VK_PRESENT_MODE_FIFO_KHR;
             ci.clipped          =VK_TRUE;
 
-            log("    pNext=%s  FIFO  IDENTITY  layers=2",
-                ci.pNext ? a.label : "null");
+            log("    Creating swapchain (layers=2 FIFO IDENTITY pNext=%s)...",
+                a.chainFse?a.label:"null");
 
             VkSwapchainKHR sc=VK_NULL_HANDLE;
-            VkResult r=vkCreateSwapchainKHR(device,&ci,nullptr,&sc);
-            log("    vkCreateSwapchainKHR -> %s (%d)",vkResultStr(r),(int)r);
+            // Wrap in SEH to catch hard driver crashes (access violations etc.)
+            // that some FSE+stereo combos trigger on 426.06.
+            VkResult r=VK_ERROR_INITIALIZATION_FAILED;
+            __try {
+                r=vkCreateSwapchainKHR(device,&ci,nullptr,&sc);
+            } __except(EXCEPTION_EXECUTE_HANDLER) {
+                log("    EXCEPTION 0x%08x during vkCreateSwapchainKHR – "
+                    "driver crash for this FSE mode",GetExceptionCode());
+                sc=VK_NULL_HANDLE;
+                continue;
+            }
+            log("    -> %s (%d)",vkResultStr(r),(int)r);
 
             if(r==VK_SUCCESS){
-                log("    SUCCESS with FSE=%s", a.label);
+                log("    SUCCESS: FSE mode = %s",a.label);
                 return sc;
             }
-            // Failed – if APPLICATION_CONTROLLED, try explicit acquire
-            // (acquires exclusive mode; may succeed after swapchain creation)
-            if(a.chainFse && hasFSE &&
-               a.fseMode==VK_FULL_SCREEN_EXCLUSIVE_APPLICATION_CONTROLLED_EXT){
-                // Already failed at swapchain creation; nothing to acquire.
-                log("    (APPLICATION_CONTROLLED: swapchain creation failed; skipping acquire)");
-            }
         }
-        return VK_NULL_HANDLE; // all attempts failed
+        return VK_NULL_HANDLE;
     }
 
     // -----------------------------------------------------------------------
-    void createSwapchain(HWND hwnd) {
+    void createSwapchain(HWND hwnd){
         log("--- createSwapchain ---");
 
         VkSurfaceCapabilitiesKHR caps{};
@@ -642,29 +720,30 @@ struct StereoApp {
         swapExtent.height=vk_clamp(wh,caps.minImageExtent.height,caps.maxImageExtent.height);
         log("  Extent: %ux%u",swapExtent.width,swapExtent.height);
 
-        uint32_t imgCount=caps.minImageCount; // min for stereo
-        log("  imageCount: %u (min=%u)",imgCount,caps.minImageCount);
-
         if(stereo){
-            log("  STEREO: probing FSE modes after NVAPI registration...");
+            uint32_t imgCount=caps.minImageCount;
+            log("  STEREO probe: imageCount=%u  stereoHandle=%p",
+                imgCount,(void*)s_stereoHandle);
             swapchain=tryCreateStereoSwapchain(swapExtent,fmt,imgCount,hwnd);
             if(swapchain==VK_NULL_HANDLE){
-                log("  ALL FSE MODES FAILED. Possible remaining causes:");
-                log("    - NvAPI_Stereo_Enable() was not accepted by the driver");
-                log("    - The stereo driver service (nvStereoService) is not running");
-                log("    - The process has a flag in an NVIDIA app profile blocking stereo");
-                log("    - The Vulkan ICD is not the NVIDIA one (check vkGetPhysicalDeviceProperties)");
-                log("    - This driver version does not support Vulkan stereo without D3D11 init");
+                log("  ALL STEREO ATTEMPTS FAILED.");
+                log("  Remaining hypotheses:");
+                log("    1. This driver requires the app be whitelisted in an");
+                log("       NVIDIA application profile (check NVIDIA Inspector).");
+                log("    2. The stereo ICD path requires a Vulkan device handle");
+                log("       passed to NVAPI (NvAPI_Vulkan_* functions if they exist).");
+                log("    3. Vulkan imageArrayLayers=2 stereo is not functional on");
+                log("       426.06 without an undocumented registry key or NVAPI flag.");
+                log("    4. Try enabling 'Allow application to control' stereo mode");
+                log("       in NVIDIA Control Panel -> Manage 3D Settings.");
                 throw std::runtime_error(
-                    "Stereo swapchain creation failed with all FSE modes.\n"
-                    "Check vulkan_stereo.log for diagnostics.");
+                    "Stereo swapchain creation failed (all modes).\n"
+                    "See vulkan_stereo.log for details.");
             }
         } else {
-            // Non-stereo: simple single-layer swapchain, no FSE
-            imgCount=caps.minImageCount+1;
+            uint32_t imgCount=caps.minImageCount+1;
             if(caps.maxImageCount&&imgCount>caps.maxImageCount) imgCount=caps.maxImageCount;
             log("  NON-STEREO: imageCount=%u",imgCount);
-
             VkSwapchainCreateInfoKHR ci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
             ci.surface=surface; ci.minImageCount=imgCount;
             ci.imageFormat=swapFmt; ci.imageColorSpace=fmt.colorSpace;
@@ -697,12 +776,12 @@ struct StereoApp {
             };
             viewLeft[i]=makeView(0);
             if(stereo) viewRight[i]=makeView(1);
-            log("  image[%u]: L=%p  R=%p",i,(void*)viewLeft[i],(void*)viewRight[i]);
+            log("  image[%u]: L=%p R=%p",i,(void*)viewLeft[i],(void*)viewRight[i]);
         }
     }
 
     // -----------------------------------------------------------------------
-    VkRenderPass makeRenderPass() {
+    VkRenderPass makeRenderPass(){
         VkAttachmentDescription att{};
         att.format=swapFmt; att.samples=VK_SAMPLE_COUNT_1_BIT;
         att.loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR;
@@ -711,37 +790,32 @@ struct StereoApp {
         att.stencilStoreOp=VK_ATTACHMENT_STORE_OP_DONT_CARE;
         att.initialLayout=VK_IMAGE_LAYOUT_UNDEFINED;
         att.finalLayout=VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-
         VkAttachmentReference ref{0,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
         VkSubpassDescription sub{};
         sub.pipelineBindPoint=VK_PIPELINE_BIND_POINT_GRAPHICS;
         sub.colorAttachmentCount=1; sub.pColorAttachments=&ref;
-
         VkSubpassDependency dep{};
         dep.srcSubpass=VK_SUBPASS_EXTERNAL; dep.dstSubpass=0;
         dep.srcStageMask=VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         dep.srcAccessMask=0;
         dep.dstStageMask=VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         dep.dstAccessMask=VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-
         VkRenderPassCreateInfo rci{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
         rci.attachmentCount=1; rci.pAttachments=&att;
         rci.subpassCount=1;    rci.pSubpasses=&sub;
         rci.dependencyCount=1; rci.pDependencies=&dep;
-
         VkRenderPass rp=VK_NULL_HANDLE;
         VK_CHECK(vkCreateRenderPass(device,&rci,nullptr,&rp));
         return rp;
     }
 
-    void createRenderPasses() {
+    void createRenderPasses(){
         log("--- createRenderPasses ---");
         renderPassLeft=makeRenderPass();
         if(stereo) renderPassRight=makeRenderPass();
     }
 
-    // -----------------------------------------------------------------------
-    void createFramebuffers() {
+    void createFramebuffers(){
         log("--- createFramebuffers ---");
         fbLeft .resize(swapCount,VK_NULL_HANDLE);
         fbRight.resize(swapCount,VK_NULL_HANDLE);
@@ -759,8 +833,7 @@ struct StereoApp {
         }
     }
 
-    // -----------------------------------------------------------------------
-    void createCommandPool() {
+    void createCommandPool(){
         log("--- createCommandPool ---");
         VkCommandPoolCreateInfo ci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
         ci.queueFamilyIndex=queueFamily;
@@ -768,7 +841,7 @@ struct StereoApp {
         VK_CHECK(vkCreateCommandPool(device,&ci,nullptr,&cmdPool));
     }
 
-    void allocateCommandBuffers() {
+    void allocateCommandBuffers(){
         log("--- allocateCommandBuffers ---");
         cmdBufs.resize(swapCount);
         VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
@@ -777,8 +850,7 @@ struct StereoApp {
         VK_CHECK(vkAllocateCommandBuffers(device,&ai,cmdBufs.data()));
     }
 
-    // -----------------------------------------------------------------------
-    void createSyncObjects() {
+    void createSyncObjects(){
         log("--- createSyncObjects ---");
         VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
         VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
@@ -790,16 +862,13 @@ struct StereoApp {
         }
     }
 
-    // -----------------------------------------------------------------------
-    void recordCommandBuffer(uint32_t idx) {
+    void recordCommandBuffer(uint32_t idx){
         VkCommandBuffer cb=cmdBufs[idx];
         VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         VK_CHECK(vkBeginCommandBuffer(cb,&bi));
-
         VkRenderPassBeginInfo rpbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
         rpbi.renderArea={{0,0},swapExtent}; rpbi.clearValueCount=1;
-
-        // Left eye: CYAN (layer 0) – always
+        // Left eye: CYAN
         {
             VkClearValue cv{};
             cv.color.float32[0]=0.f; cv.color.float32[1]=1.f;
@@ -809,7 +878,7 @@ struct StereoApp {
             vkCmdBeginRenderPass(cb,&rpbi,VK_SUBPASS_CONTENTS_INLINE);
             vkCmdEndRenderPass(cb);
         }
-        // Right eye: RED (layer 1) – stereo only
+        // Right eye: RED (stereo only)
         if(stereo){
             VkClearValue cv{};
             cv.color.float32[0]=1.f; cv.color.float32[1]=0.f;
@@ -822,22 +891,18 @@ struct StereoApp {
         VK_CHECK(vkEndCommandBuffer(cb));
     }
 
-    // -----------------------------------------------------------------------
-    void drawFrame() {
+    void drawFrame(){
         uint32_t fi=frameIndex%MAX_FRAMES;
         vkWaitForFences(device,1,&inFlight[fi],VK_TRUE,UINT64_MAX);
-
         uint32_t imgIdx=0; VkResult r;
         VK_CHECK_SWAPCHAIN(
             vkAcquireNextImageKHR(device,swapchain,UINT64_MAX,
                                   imageReady[fi],VK_NULL_HANDLE,&imgIdx),r);
         if(r==VK_ERROR_OUT_OF_DATE_KHR||r==VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT)
             return;
-
         vkResetFences(device,1,&inFlight[fi]);
         vkResetCommandBuffer(cmdBufs[imgIdx],0);
         recordCommandBuffer(imgIdx);
-
         VkPipelineStageFlags ws=VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         si.waitSemaphoreCount=1;   si.pWaitSemaphores=&imageReady[fi];
@@ -845,18 +910,15 @@ struct StereoApp {
         si.commandBufferCount=1;   si.pCommandBuffers=&cmdBufs[imgIdx];
         si.signalSemaphoreCount=1; si.pSignalSemaphores=&renderDone[fi];
         VK_CHECK(vkQueueSubmit(queue,1,&si,inFlight[fi]));
-
         VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
         pi.waitSemaphoreCount=1; pi.pWaitSemaphores=&renderDone[fi];
         pi.swapchainCount=1;     pi.pSwapchains=&swapchain;
         pi.pImageIndices=&imgIdx;
         VK_CHECK_SWAPCHAIN(vkQueuePresentKHR(queue,&pi),r);
-
         ++frameIndex;
     }
 
-    // -----------------------------------------------------------------------
-    void cleanup() {
+    void cleanup(){
         log("--- cleanup ---");
         if(device) vkDeviceWaitIdle(device);
         for(uint32_t i=0;i<MAX_FRAMES;++i){
@@ -889,14 +951,19 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     AllocConsole();
     FILE *f=nullptr; freopen_s(&f,"CONOUT$","w",stdout);
     logInit();
-    log("=== VkStereo3DVision v7 startup ===");
+    log("=== VkStereo3DVision v8 startup ===");
 
     logDisplayMode();
 
-    // NVAPI stereo registration – MUST happen before Vulkan swapchain creation.
-    // The driver refuses imageArrayLayers=2 swapchains for unregistered processes.
-    bool nvapiOk = nvapiInit();
-    log("  NVAPI overall: %s", nvapiOk?"OK":"FAILED (stereo swapchain may not work)");
+    // Step 1: Create a D3D11 device (dynamically – no d3d11.lib needed).
+    // This is needed to create an NVAPI stereo handle bound to a real device,
+    // which is what registers this process with the 3D Vision stereo subsystem.
+    bool d3dOk = d3d11Bootstrap();
+
+    // Step 2: NVAPI init + NvAPI_Stereo_CreateHandleFromIUnknown.
+    bool nvapiOk = nvapiInit(s_pD3DDevice);
+    log("  D3D11: %s  NVAPI: %s",
+        d3dOk?"OK":"FAILED", nvapiOk?"OK":"FAILED");
 
     StereoApp app{};
     try {
@@ -914,16 +981,17 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
             if(!s_quit){
                 app.drawFrame();
                 if(++frameCount==5)
-                    log("  (first 5 frames OK – call-level logging suppressed)");
+                    log("  (first 5 frames OK – logging suppressed)");
             }
         }
-        log("--- render loop exited after %u frames ---",frameCount);
+        log("--- exited after %u frames ---",frameCount);
     } catch(const std::exception &e){
         log("EXCEPTION: %s",e.what());
         MessageBoxA(nullptr,e.what(),"Fatal Error",MB_OK|MB_ICONERROR);
     }
     app.cleanup();
     nvapiShutdown();
+    d3d11Shutdown();
     if(s_logFile) fclose(s_logFile);
     return 0;
 }
