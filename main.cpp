@@ -52,9 +52,15 @@
  *   Log: vulkan_stereo.log beside the exe.   ESC to quit.
  */
 
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS
+#endif
 
 #define VK_USE_PLATFORM_WIN32_KHR
 #include <vulkan/vulkan.h>
@@ -141,7 +147,7 @@ typedef struct { UINT W,H; DXGI_RATIONAL_ Refresh; DXGI_FORMAT_ Fmt; UINT SLO,Sc
 typedef struct { UINT Count,Quality; } DXGI_SAMPLE_DESC_;
 typedef struct {
     DXGI_MODE_DESC_ BD; DXGI_SAMPLE_DESC_ SD;
-    DXGI_USAGE_ BU; UINT BC; HWND OW; BOOL Win; DSE_DISCARD SE; UINT Fl;
+    DXGI_USAGE_ BU; UINT BC; HWND OW; BOOL Win; DXGI_SWAP_EFFECT_ SE; UINT Fl;
 } DXGI_SWAP_CHAIN_DESC_;
 
 // D3D11_RENDER_TARGET_VIEW_DESC – just enough for Texture2D
