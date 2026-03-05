@@ -13,29 +13,28 @@
  *       NOT in this driver's NVAPI dispatch table.  Without it the driver never
  *       learns the buffer is a stereo pair.
  *
- * ── v16 FIX: ReverseStereoBlitControl ────────────────────────────────────────
+ * ── v16 BUG + v17 FIX ────────────────────────────────────────────────────────
  *
- *  NvAPI_Stereo_ReverseStereoBlitControl (ID 0x3CD58F89) is a function that
- *  exists in older NVAPI builds.  When enabled around a CopyResource call, the
- *  driver intercepts the copy and treats the source as a stereo pair:
- *    left  half of source → left  eye buffer
- *    right half of source → right eye buffer
+ *  v16 produced a black screen.  Root cause: CopyResource requires source and
+ *  destination to have identical dimensions.  s_pBBTex is 1920×1080 and
+ *  s_pStereoSrc was 3840×1080 → copy failed silently → back buffer stayed black.
+ *
+ *  Correct interpretation of ReverseStereoBlitControl:
+ *    - The back buffer IS the left eye buffer.  Clear it normally.
+ *    - ReverseStereoBlitControl(TRUE) + CopyResource(BB, rightEyeTex) routes
+ *      rightEyeTex into the RIGHT eye only, overriding it separately.
+ *    - rightEyeTex must be W×H (matches BB dimensions exactly).
  *
  *  Sequence per frame:
- *    1. ClearRTV(eyeLeft,  CYAN) on a W×H staging texture
- *    2. ClearRTV(eyeRight, RED)  on a second W×H staging texture
- *    3. CopySubresourceRegion: eyeLeft  → stereoSrc at (0,   0)
- *    4. CopySubresourceRegion: eyeRight → stereoSrc at (W,   0)
- *       stereoSrc is now 2W×H with left|right layout
- *    5. NvAPI_Stereo_ReverseStereoBlitControl(handle, TRUE)
- *    6. CopyResource(backBuffer, stereoSrc)
- *       Driver intercepts: routes left half → left eye, right half → right eye
- *    7. NvAPI_Stereo_ReverseStereoBlitControl(handle, FALSE)
- *    8. Present(1)
+ *    1. ClearRTV(backBufferRTV, CYAN)     ← sets left eye
+ *    2. ClearRTV(rightEyeRTV,  RED)       ← prepare right eye content
+ *    3. NvAPI_Stereo_ReverseStereoBlitControl(handle, TRUE)
+ *    4. CopyResource(backBuffer, rightEyeTex)   ← overrides right eye only
+ *    5. NvAPI_Stereo_ReverseStereoBlitControl(handle, FALSE)
+ *    6. Present(1)
  *
- *  Swap chain is standard W×H (1920×1080) — no double-wide display mode,
- *  no SetSurfaceCreationMode, no SetActiveEye required.
- *  SetDriverMode: AUTO (0) — the driver must own the stereo interception path.
+ *  All textures are W×H — no 2W×H, no dimension mismatch.
+ *  SetDriverMode: AUTO (0).
  *
  * ── AUTO-RESTORE ─────────────────────────────────────────────────────────────
  *
@@ -217,9 +216,9 @@ static IUnknown *s_pD3DDev    = nullptr;  // ID3D11Device
 static IUnknown *s_pDXGISC    = nullptr;  // IDXGISwapChain (W×H)
 static IUnknown *s_pD3DCtx    = nullptr;  // ID3D11DeviceContext
 static IUnknown *s_pBBTex     = nullptr;  // back buffer Texture2D (W×H)
-static IUnknown *s_pEyeTex[2] = {};       // W×H per-eye staging textures
-static IUnknown *s_pEyeRTV[2] = {};       // RTVs on staging textures
-static IUnknown *s_pStereoSrc = nullptr;  // 2W×H source texture for reverse blit
+static IUnknown *s_pBBRTV     = nullptr;  // RTV on back buffer  (left eye)
+static IUnknown *s_pRightTex  = nullptr;  // W×H right-eye staging texture
+static IUnknown *s_pRightRTV  = nullptr;  // RTV on right-eye texture
 static int       s_dispW=0, s_dispH=0;
 
 static void safeRelease(IUnknown *&p){if(p){p->Release();p=nullptr;}}
@@ -267,54 +266,54 @@ static bool d3d11CreateSwapChain(HWND hwnd) {
     return SUCCEEDED(hr)&&s_pDXGISC;
 }
 
-// Create/recreate all textures and RTVs after FSE transition.
-// Textures:
-//   s_pEyeTex[0/1] : W×H  – one per eye, cleared with solid colour each frame
-//   s_pStereoSrc   : 2W×H – left|right assembled here before the reverse blit
-//   s_pBBTex       : W×H  – the actual swap chain back buffer (copy destination)
+// Build textures and RTVs after FSE transition.
+//   s_pBBTex    : W×H swap chain back buffer  (also serves as left-eye CopyResource dst)
+//   s_pBBRTV    : RTV on back buffer           (left eye clear target)
+//   s_pRightTex : W×H right-eye staging tex   (cleared RED each frame)
+//   s_pRightRTV : RTV on right-eye texture
+//
+// ReverseStereoBlitControl is used as:
+//   ClearRTV(BBRTV, CYAN)                         ← left  eye
+//   ClearRTV(RightRTV, RED)                        ← prepare right eye
+//   ReverseStereoBlitControl(TRUE)
+//   CopyResource(BBTex, RightTex)                  ← overrides right eye
+//   ReverseStereoBlitControl(FALSE)
+//   Present(1)
+//
+// All textures are W×H – no dimension mismatch for CopyResource.
 static bool d3d11BuildTextures() {
-    safeRelease(s_pEyeRTV[0]); safeRelease(s_pEyeRTV[1]);
-    safeRelease(s_pEyeTex[0]); safeRelease(s_pEyeTex[1]);
-    safeRelease(s_pStereoSrc); safeRelease(s_pBBTex);
+    safeRelease(s_pBBRTV); safeRelease(s_pBBTex);
+    safeRelease(s_pRightRTV); safeRelease(s_pRightTex);
     if(!s_pD3DDev||!s_pDXGISC) return false;
     if(!s_pD3DCtx) vcall<40,void>(s_pD3DDev,(IUnknown**)&s_pD3DCtx);
 
-    // Back buffer (copy destination – no RTV needed)
+    // Back buffer + RTV (left eye)
     HRESULT hr=vcall<9>(s_pDXGISC,(UINT)0,&s_iidTex2D,(void**)&s_pBBTex);
     log("  GetBuffer: hr=0x%x  tex=%p",(unsigned)hr,(void*)s_pBBTex);
     if(FAILED(hr)||!s_pBBTex) return false;
+    hr=vcall<9>(s_pD3DDev,s_pBBTex,(void*)nullptr,(IUnknown**)&s_pBBRTV);
+    log("  CreateRTV(BB): hr=0x%x  rtv=%p",(unsigned)hr,(void*)s_pBBRTV);
+    if(FAILED(hr)||!s_pBBRTV) return false;
 
+    // Right-eye staging texture + RTV  (W×H – must match BB exactly for CopyResource)
     D3D11_TEX2D_DESC_ td{};
+    td.Width=(UINT)s_dispW; td.Height=(UINT)s_dispH;
     td.MipLevels=1; td.ArraySize=1; td.Format=DFMT_B8G8R8A8;
     td.SampleDesc={1,0}; td.Usage=0; td.BindFlags=0x20; // RENDER_TARGET
-
-    // Per-eye W×H staging textures
-    td.Width=(UINT)s_dispW; td.Height=(UINT)s_dispH;
-    for(int e=0;e<2;++e){
-        hr=vcall<5>(s_pD3DDev,&td,(void*)nullptr,(IUnknown**)&s_pEyeTex[e]);
-        log("  CreateTexture2D[%d] W×H: hr=0x%x  tex=%p",e,(unsigned)hr,(void*)s_pEyeTex[e]);
-        if(FAILED(hr)||!s_pEyeTex[e]) return false;
-        hr=vcall<9>(s_pD3DDev,s_pEyeTex[e],(void*)nullptr,(IUnknown**)&s_pEyeRTV[e]);
-        log("  CreateRTV[%d]: hr=0x%x  rtv=%p",e,(unsigned)hr,(void*)s_pEyeRTV[e]);
-        if(FAILED(hr)||!s_pEyeRTV[e]) return false;
-    }
-
-    // 2W×H source texture for the reverse blit copy
-    // Needs D3D11_BIND_RENDER_TARGET only (no shader resource needed)
-    td.Width=(UINT)(s_dispW*2); td.Height=(UINT)s_dispH;
-    td.BindFlags=0x20; // RENDER_TARGET (driver copies from this)
-    hr=vcall<5>(s_pD3DDev,&td,(void*)nullptr,(IUnknown**)&s_pStereoSrc);
-    log("  CreateTexture2D 2W×H (stereo src): hr=0x%x  tex=%p",(unsigned)hr,(void*)s_pStereoSrc);
-    if(FAILED(hr)||!s_pStereoSrc) return false;
+    hr=vcall<5>(s_pD3DDev,&td,(void*)nullptr,(IUnknown**)&s_pRightTex);
+    log("  CreateTexture2D W×H (right eye): hr=0x%x  tex=%p",(unsigned)hr,(void*)s_pRightTex);
+    if(FAILED(hr)||!s_pRightTex) return false;
+    hr=vcall<9>(s_pD3DDev,s_pRightTex,(void*)nullptr,(IUnknown**)&s_pRightRTV);
+    log("  CreateRTV(right): hr=0x%x  rtv=%p",(unsigned)hr,(void*)s_pRightRTV);
+    if(FAILED(hr)||!s_pRightRTV) return false;
 
     return true;
 }
 
 static bool d3d11GoFSE() {
     log("--- Going fullscreen exclusive ---");
-    safeRelease(s_pEyeRTV[0]); safeRelease(s_pEyeRTV[1]);
-    safeRelease(s_pEyeTex[0]); safeRelease(s_pEyeTex[1]);
-    safeRelease(s_pStereoSrc); safeRelease(s_pBBTex);
+    safeRelease(s_pBBRTV); safeRelease(s_pBBTex);
+    safeRelease(s_pRightRTV); safeRelease(s_pRightTex);
     HRESULT hr=vcall<10>(s_pDXGISC,TRUE,(void*)nullptr);
     log("  SetFullscreenState(TRUE): hr=0x%x (%s)",(unsigned)hr,SUCCEEDED(hr)?"OK":"FAILED");
     if(FAILED(hr)) return false;
@@ -327,9 +326,8 @@ static bool d3d11GoFSE() {
 
 static void d3d11Shutdown(){
     if(s_pDXGISC) vcall<10>(s_pDXGISC,FALSE,(void*)nullptr);
-    safeRelease(s_pEyeRTV[0]); safeRelease(s_pEyeRTV[1]);
-    safeRelease(s_pEyeTex[0]); safeRelease(s_pEyeTex[1]);
-    safeRelease(s_pStereoSrc); safeRelease(s_pBBTex);
+    safeRelease(s_pBBRTV); safeRelease(s_pBBTex);
+    safeRelease(s_pRightRTV); safeRelease(s_pRightTex);
     safeRelease(s_pD3DCtx); safeRelease(s_pDXGISC); safeRelease(s_pD3DDev);
     if(s_hD3D11){FreeLibrary(s_hD3D11);s_hD3D11=nullptr;}
 }
@@ -452,9 +450,8 @@ static void runStereoLoop() {
         if(s_restore){
             s_restore=false;
             log("  frame=%-6u  Restoring FSE + 3DV...",frame);
-            safeRelease(s_pEyeRTV[0]); safeRelease(s_pEyeRTV[1]);
-            safeRelease(s_pEyeTex[0]); safeRelease(s_pEyeTex[1]);
-            safeRelease(s_pStereoSrc); safeRelease(s_pBBTex);
+            safeRelease(s_pBBRTV); safeRelease(s_pBBTex);
+            safeRelease(s_pRightRTV); safeRelease(s_pRightTex);
             HRESULT hr=vcall<10>(s_pDXGISC,TRUE,(void*)nullptr);
             log("  SetFullscreenState(TRUE): hr=0x%x",(unsigned)hr);
             vcall<13>(s_pDXGISC,(UINT)2,(UINT)s_dispW,(UINT)s_dispH,(int)DFMT_UNKNOWN,(UINT)0);
@@ -465,36 +462,31 @@ static void runStereoLoop() {
             log("  Restore complete");
         }
 
-        if(!s_pEyeRTV[0]||!s_pEyeRTV[1]||!s_pStereoSrc||!s_pBBTex){
+        if(!s_pBBRTV||!s_pRightRTV||!s_pBBTex||!s_pRightTex){
             Sleep(16); continue;
         }
 
-        // ── Per-eye clear ─────────────────────────────────────────────────────
+        // ── Left eye: clear back buffer to CYAN ──────────────────────────────
         float cyan[4]={0.f,1.f,1.f,1.f};
-        float red [4]={1.f,0.f,0.f,1.f};
-        vcall<33,void>(s_pD3DCtx,(UINT)1,&s_pEyeRTV[0],(void*)nullptr);
-        vcall<50,void>(s_pD3DCtx,s_pEyeRTV[0],cyan);
-        vcall<33,void>(s_pD3DCtx,(UINT)1,&s_pEyeRTV[1],(void*)nullptr);
-        vcall<50,void>(s_pD3DCtx,s_pEyeRTV[1],red);
+        vcall<33,void>(s_pD3DCtx,(UINT)1,&s_pBBRTV,(void*)nullptr);
+        vcall<50,void>(s_pD3DCtx,s_pBBRTV,cyan);
 
-        // ── Assemble 2W×H stereo source: eye[0]=left  eye[1]=right ───────────
-        // CopySubresourceRegion (ctx vtable 46):
-        //   (pDst, DstSub, DstX, DstY, DstZ, pSrc, SrcSub, pSrcBox)
-        vcall<46,void>(s_pD3DCtx,
-            s_pStereoSrc, (UINT)0, (UINT)0,       (UINT)0, (UINT)0,
-            s_pEyeTex[0], (UINT)0, (void*)nullptr);
-        vcall<46,void>(s_pD3DCtx,
-            s_pStereoSrc, (UINT)0, (UINT)s_dispW, (UINT)0, (UINT)0,
-            s_pEyeTex[1], (UINT)0, (void*)nullptr);
+        // ── Right eye: clear staging texture to RED ───────────────────────────
+        float red[4]={1.f,0.f,0.f,1.f};
+        vcall<33,void>(s_pD3DCtx,(UINT)1,&s_pRightRTV,(void*)nullptr);
+        vcall<50,void>(s_pD3DCtx,s_pRightRTV,red);
 
-        // ── Reverse stereo blit: copy 2W×H → W×H back buffer ─────────────────
-        // With ReverseStereoBlitControl enabled, the driver intercepts
-        // CopyResource and routes left half → left eye, right half → right eye.
-        // Without it we fall back to a plain copy (both eyes see left half only).
-        if(s_fnReverseBlit) s_fnReverseBlit(s_hStereo, 1);
-        // CopyResource (ctx vtable 47): (pDst, pSrc)
-        vcall<47,void>(s_pD3DCtx, s_pBBTex, s_pStereoSrc);
-        if(s_fnReverseBlit) s_fnReverseBlit(s_hStereo, 0);
+        // ── ReverseStereoBlitControl + CopyResource → right eye override ──────
+        // With ReverseStereoBlitControl(TRUE), CopyResource(BB, rightTex)
+        // routes rightTex into the RIGHT eye buffer instead of the left.
+        // Both textures are W×H – no dimension mismatch.
+        // Without the fn (shouldn't happen – already probed), both eyes = CYAN.
+        if(s_fnReverseBlit){
+            s_fnReverseBlit(s_hStereo, 1);
+            HRESULT hrCopy=vcall<47>(s_pD3DCtx, s_pBBTex, s_pRightTex);
+            s_fnReverseBlit(s_hStereo, 0);
+            if(frame==1) log("  CopyResource(BB,rightTex) hr=0x%x",(unsigned)hrCopy);
+        }
 
         // ── Present ───────────────────────────────────────────────────────────
         HRESULT hr=dxgiPresent(1);
@@ -736,7 +728,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int){
     AllocConsole();
     FILE *f=nullptr; freopen_s(&f,"CONOUT$","w",stdout);
     logInit();
-    log("=== VkStereo3DVision v16 startup ===");
+    log("=== VkStereo3DVision v17 startup ===");
     logDisplayMode();
 
     s_hwnd=createFullscreenWindow(hInst);
@@ -754,7 +746,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int){
         bool fseOk = scOk && d3d11GoFSE();
         nvapiActivate();
 
-        if(!s_pEyeRTV[0]||!s_pEyeRTV[1]){
+        if(!s_pBBRTV||!s_pRightRTV){
             log("FATAL: texture setup failed");
             MessageBoxA(nullptr,"D3D11 texture setup failed","Error",MB_OK|MB_ICONERROR);
         } else {
