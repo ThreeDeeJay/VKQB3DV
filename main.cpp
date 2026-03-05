@@ -371,41 +371,56 @@ typedef int(*PfnRSBC)(void*, unsigned char);  // (handle, enable)
 
 static PfnRSBC s_fnReverseBlit = nullptr;
 
-static bool nvapiInit(IUnknown *pDev) {
-    log("--- NVAPI init ---");
+// Phase 1: load NVAPI, initialize, enable.  Call before device creation.
+static bool nvapiPhase1() {
+    log("--- NVAPI phase 1 ---");
     s_hNvapi=LoadLibraryA("nvapi64.dll");
     if(!s_hNvapi){log("  nvapi64.dll: not found"); return false;}
     s_nvQI=(PfnNvQI)GetProcAddress(s_hNvapi,"nvapi_QueryInterface");
     if(!s_nvQI){log("  nvapi_QueryInterface: not found"); return false;}
     log("  nvapi64.dll OK");
-
     {auto fn=(PfnNvV)nvQ(NvID_Initialize);
-     if(!fn){log("  NvAPI_Initialize fn: not found"); return false;}
+     if(!fn){log("  NvAPI_Initialize: not found"); return false;}
      int r=fn(); log("  NvAPI_Initialize = %d",r); if(r)return false;}
-
     {auto fn=(PfnNvV)nvQ(NvID_Stereo_Enable);
      if(fn){int r=fn(); log("  NvAPI_Stereo_Enable = %d",r);}}
-
-    {auto fn=(PfnNvFromIUnk)nvQ(NvID_Stereo_CreateFromIUnk);
-     if(fn&&pDev){
-         int r=fn(pDev,&s_hStereo);
-         log("  NvAPI_Stereo_CreateHandleFromIUnknown = %d (%s)  handle=%p",
-             r,r==NVAPI_OK?"OK":"FAILED",(void*)s_hStereo);
-         if(r!=NVAPI_OK) s_hStereo=nullptr;
-     }}
-    if(!s_hStereo){log("  No stereo handle"); return false;}
-
-    // AUTO mode (0): driver owns the stereo interception path.
-    // ReverseStereoBlitControl only works in AUTO mode.
+    // AUTO mode – driver handles stereo routing
     {typedef int(*Pfn)(unsigned); auto fn=(Pfn)nvQ(NvID_Stereo_SetMode);
      if(fn){int r=fn(0); log("  NvAPI_Stereo_SetDriverMode(AUTO=0) = %d",r);}}
+    return true;
+}
 
-    // Probe ReverseStereoBlitControl
+// Phase 2: create stereo handle from the SWAP CHAIN (not the device).
+// Called after FSE is acquired.  Binding the handle to the swap chain causes
+// the driver to recognise the back buffer as the stereo target and allocate
+// the right-eye companion surface.  Creating the handle from the device alone
+// (as in v11-v18) does NOT trigger companion allocation on this driver.
+static bool nvapiPhase2(IUnknown *pSwapChain) {
+    log("--- NVAPI phase 2 (post-FSE, handle from swap chain) ---");
+    if(!pSwapChain){log("  no swap chain"); return false;}
+    auto fn=(PfnNvFromIUnk)nvQ(NvID_Stereo_CreateFromIUnk);
+    if(!fn){log("  CreateHandleFromIUnknown fn: not found"); return false;}
+    int r=fn(pSwapChain,&s_hStereo);
+    log("  NvAPI_Stereo_CreateHandleFromIUnknown(SwapChain) = %d (%s)  handle=%p",
+        r,r==NVAPI_OK?"OK":"FAILED",(void*)s_hStereo);
+    if(r!=NVAPI_OK){s_hStereo=nullptr; return false;}
     s_fnReverseBlit=(PfnRSBC)nvQ(NvID_Stereo_ReverseBlit);
     log("  NvAPI_Stereo_ReverseStereoBlitControl: %s",
         s_fnReverseBlit?"FOUND":"NOT FOUND");
 
-    log("  NVAPI init done  handle=%p",(void*)s_hStereo);
+    // Probe additional functions for diagnostics
+    {void *f=nvQ(0xF5DCFDE8u); log("  SetSurfaceCreationMode: %s",f?"FOUND":"not found");}
+    {void *f=nvQ(0x36F1C736u); log("  GetSurfaceCreationMode: %s",f?"FOUND":"not found");}
+    {void *f=nvQ(0x96EEA9D9u); log("  SetActiveEye:           %s",f?"FOUND":"not found");}
+    {void *f=nvQ(0x204211C2u); log("  D3D1x_CreateStereoParamsBuffer: %s",f?"FOUND":"not found");}
+    {void *f=nvQ(0x3A8C8519u); log("  Stereo_SetEachRTAsStereoEye:    %s",f?"FOUND":"not found");}
+
+    // GetSurfaceCreationMode to see if binding to SC changed it
+    {typedef int(*Pfn)(void*,unsigned*); auto gf=(Pfn)nvQ(0x36F1C736u);
+     if(gf){unsigned mode=99; gf(s_hStereo,&mode);
+            log("  GetSurfaceCreationMode = %u (0=AUTO 1=FORCESTEREO 2=FORCEMONO)",mode);}}
+
+    log("  Phase 2 done");
     return true;
 }
 
@@ -733,24 +748,34 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int){
     AllocConsole();
     FILE *f=nullptr; freopen_s(&f,"CONOUT$","w",stdout);
     logInit();
-    log("=== VkStereo3DVision v18 startup ===");
+    log("=== VkStereo3DVision v19 startup ===");
     logDisplayMode();
 
     s_hwnd=createFullscreenWindow(hInst);
     s_dispW=GetSystemMetrics(SM_CXSCREEN);
     s_dispH=GetSystemMetrics(SM_CYSCREEN);
 
-    bool d3dOk=d3d11InitDevice();
-    bool nvapiOk = d3dOk && nvapiInit(s_pD3DDev);
+    // Sequence:
+    //  1. NVAPI phase1: load, init, enable, set AUTO mode
+    //  2. D3D11 device (no swap chain)
+    //  3. Create swap chain (normal W×H)
+    //  4. Go FSE
+    //  5. NVAPI phase2: CreateHandleFromIUnknown(swap chain) – binds handle to SC
+    //     so driver allocates right-eye companion on the back buffer
+    //  6. Rebuild textures (GetBuffer may now return stereo surface)
+    //  7. Activate
+    bool nv1Ok = nvapiPhase1();
+    bool d3dOk = d3d11InitDevice();
+    bool scOk  = d3dOk && d3d11CreateSwapChain(s_hwnd);
+    bool fseOk = scOk  && d3d11GoFSE();
+    bool nv2Ok = fseOk && nvapiPhase2(s_pDXGISC);
     bool stereoMode = (s_hStereo != nullptr);
-    log("  D3D11=%s  NVAPI=%s  stereoMode=%s",
-        d3dOk?"OK":"FAIL", nvapiOk?"OK":"FAIL", stereoMode?"YES":"NO");
+    log("  nv1=%s d3d=%s sc=%s fse=%s nv2=%s stereo=%s",
+        nv1Ok?"OK":"FAIL", d3dOk?"OK":"FAIL", scOk?"OK":"FAIL",
+        fseOk?"OK":"FAIL", nv2Ok?"OK":"FAIL", stereoMode?"YES":"NO");
 
     if(stereoMode){
-        bool scOk  = d3d11CreateSwapChain(s_hwnd);
-        bool fseOk = scOk && d3d11GoFSE();
-        nvapiActivate();
-
+        nvapiActivate();  // post-FSE + post-handle-creation
         if(!s_pBBRTV||!s_pRightRTV){
             log("FATAL: texture setup failed");
             MessageBoxA(nullptr,"D3D11 texture setup failed","Error",MB_OK|MB_ICONERROR);
