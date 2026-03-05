@@ -466,27 +466,32 @@ static void runStereoLoop() {
             Sleep(16); continue;
         }
 
-        // ── Left eye: clear back buffer to CYAN ──────────────────────────────
-        float cyan[4]={0.f,1.f,1.f,1.f};
-        vcall<33,void>(s_pD3DCtx,(UINT)1,&s_pBBRTV,(void*)nullptr);
-        vcall<50,void>(s_pD3DCtx,s_pBBRTV,cyan);
+        // ── Render order: RSBC copy FIRST, then left-eye clear ───────────────
+        //
+        // Problem observed in v17: CopyResource(BB, rightTex) with RSBC(TRUE)
+        // routes rightTex → right-eye companion (good) but ALSO overwrites the
+        // BB pixel data with RED (side-effect of the copy dst being BB itself).
+        // Clearing BB to CYAN before the copy means CYAN gets trampled → left=RED.
+        //
+        // Fix: do the RSBC copy first, then clear BB to CYAN.
+        // After: right-eye companion = RED, BB (left eye) = CYAN → correct.
 
-        // ── Right eye: clear staging texture to RED ───────────────────────────
+        // Step 1: prepare right-eye content
         float red[4]={1.f,0.f,0.f,1.f};
         vcall<33,void>(s_pD3DCtx,(UINT)1,&s_pRightRTV,(void*)nullptr);
         vcall<50,void>(s_pD3DCtx,s_pRightRTV,red);
 
-        // ── ReverseStereoBlitControl + CopyResource → right eye override ──────
-        // With ReverseStereoBlitControl(TRUE), CopyResource(BB, rightTex)
-        // routes rightTex into the RIGHT eye buffer instead of the left.
-        // Both textures are W×H – no dimension mismatch.
-        // Without the fn (shouldn't happen – already probed), both eyes = CYAN.
+        // Step 2: RSBC copy → right-eye companion = RED; BB also becomes RED
         if(s_fnReverseBlit){
             s_fnReverseBlit(s_hStereo, 1);
-            HRESULT hrCopy=vcall<47>(s_pD3DCtx, s_pBBTex, s_pRightTex);
+            vcall<47,void>(s_pD3DCtx, s_pBBTex, s_pRightTex);
             s_fnReverseBlit(s_hStereo, 0);
-            if(frame==1) log("  CopyResource(BB,rightTex) hr=0x%x",(unsigned)hrCopy);
         }
+
+        // Step 3: clear BB to CYAN → left eye = CYAN (restores BB after copy)
+        float cyan[4]={0.f,1.f,1.f,1.f};
+        vcall<33,void>(s_pD3DCtx,(UINT)1,&s_pBBRTV,(void*)nullptr);
+        vcall<50,void>(s_pD3DCtx,s_pBBRTV,cyan);
 
         // ── Present ───────────────────────────────────────────────────────────
         HRESULT hr=dxgiPresent(1);
@@ -728,7 +733,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int){
     AllocConsole();
     FILE *f=nullptr; freopen_s(&f,"CONOUT$","w",stdout);
     logInit();
-    log("=== VkStereo3DVision v17 startup ===");
+    log("=== VkStereo3DVision v18 startup ===");
     logDisplayMode();
 
     s_hwnd=createFullscreenWindow(hInst);
