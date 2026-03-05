@@ -1,30 +1,25 @@
 /*
- * vulkan_stereo_3dvision.cpp  v14
+ * vulkan_stereo_3dvision.cpp  v15
  *
  * Stereoscopic 3D – NVIDIA 3D Vision, driver 426.06 / 452.06.
  *
- * ── ROOT CAUSE FROM v13 LOG ───────────────────────────────────────────────────
+ * ── ROOT CAUSE FROM v14 LOG ───────────────────────────────────────────────────
  *
- *  NvAPI_Stereo_SetSurfaceCreationMode: NOT FOUND in dispatch table.
- *  This function does not exist in 426.06's NVAPI build.
- *  GetSurfaceCreationMode returns 0 (AUTO) confirming it was never set.
- *  Back buffer stayed mono Texture2D.
- *  CreateRTV(slice=1) = E_INVALIDARG — slice 1 doesn't exist on a mono surface.
+ *  Both eyes showed RED.  ClearRenderTargetView IGNORES the viewport/scissor
+ *  state — it always clears the ENTIRE render target.  Setting RSSetViewports
+ *  to the left half before clearing has no effect.  The right-eye RED clear
+ *  therefore overwrote the full double-width back buffer including the left
+ *  half every frame.
  *
- * ── v14 FIX: DIRECT MODE = DOUBLE-WIDTH BACK BUFFER ─────────────────────────
+ * ── v15 FIX ───────────────────────────────────────────────────────────────────
  *
- *  In NVAPI_STEREO_DRIVER_MODE_DIRECT (value 2), the driver does not allocate
- *  the back buffer as stereo on its own.  Instead it expects the application to
- *  create a swap chain with width = 2 × display width.  The left half of each
- *  frame is the left eye, the right half is the right eye.  The driver detects
- *  the double-width format on Present and composites both halves into the stereo
- *  flip engine.  No SetSurfaceCreationMode, no SetActiveEye, no Texture2DArray.
- *
- *  Layout:
- *    Back buffer: 3840 × 1080  (2 × 1920 for 1080p)
- *    Viewport A:  [0,    0, 1920, 1080]  → left  eye (CYAN)
- *    Viewport B:  [1920, 0, 1920, 1080]  → right eye (RED)
- *    Present(syncInterval=1)
+ *  Two separate W×H textures (eyeLeft, eyeRight) with their own RTVs.
+ *  ClearRenderTargetView on each fills the full W×H texture with one colour.
+ *  CopySubresourceRegion copies each texture into the correct half of the
+ *  double-width back buffer:
+ *    eyeLeft  (CYAN) → back buffer at DstX=0
+ *    eyeRight (RED)  → back buffer at DstX=W
+ *  No shaders, no pipeline state, no draw calls.
  *
  * ── AUTO-RESTORE ─────────────────────────────────────────────────────────────
  *
@@ -167,7 +162,17 @@ typedef struct {
     UINT              Fl;
 } DXGI_SWAP_CHAIN_DESC_;
 
-typedef struct { FLOAT X,Y,W,H,MinZ,MaxZ; } D3D11_VIEWPORT_;
+// D3D11_TEXTURE2D_DESC (CreateTexture2D = ID3D11Device vtable 5)
+// D3D11_USAGE: DEFAULT=0   D3D11_BIND_RENDER_TARGET=0x20
+typedef struct {
+    UINT Width, Height, MipLevels, ArraySize;
+    DXGI_FORMAT_ Format;
+    DXGI_SAMPLE_DESC_ SampleDesc;
+    UINT Usage, BindFlags, CPUAccessFlags, MiscFlags;
+} D3D11_TEX2D_DESC_;
+
+// D3D11_BOX (pass nullptr to CopySubresourceRegion for whole texture)
+typedef struct { UINT left,top,front,right,bottom,back; } D3D11_BOX_;
 
 // IID_ID3D11Texture2D
 static const GUID s_iidTex2D    = {0x6F15AAF2,0xD208,0x4E89,{0x9A,0xB4,0x48,0x95,0x35,0xD3,0x4F,0x9C}};
@@ -203,10 +208,11 @@ static R vcall(void *o,A...args){
 static HMODULE   s_hD3D11   = nullptr;
 static IUnknown *s_pD3DDev  = nullptr;  // ID3D11Device
 static IUnknown *s_pDXGISC  = nullptr;  // IDXGISwapChain
-static IUnknown *s_pD3DCtx  = nullptr;  // ID3D11DeviceContext
-static IUnknown *s_pBBTex   = nullptr;  // ID3D11Texture2D back buffer
-static IUnknown *s_pRTV     = nullptr;  // single RTV (full double-width back buffer)
-static int s_dispW=0, s_dispH=0;       // display resolution (single eye)
+static IUnknown *s_pD3DCtx      = nullptr;  // ID3D11DeviceContext
+static IUnknown *s_pBBTex       = nullptr;  // ID3D11Texture2D back buffer (double-wide)
+static IUnknown *s_pEyeTex[2]   = {};       // W×H per-eye staging textures
+static IUnknown *s_pEyeRTV[2]   = {};       // RTVs on the staging textures
+static int s_dispW=0, s_dispH=0;            // display resolution (single eye)
 
 static void safeRelease(IUnknown *&p){if(p){p->Release();p=nullptr;}}
 
@@ -270,23 +276,50 @@ static bool d3d11CreateSwapChain(HWND hwnd) {
 // Build a single RTV covering the full double-width back buffer.
 // We draw CYAN to the left viewport and RED to the right viewport
 // using two separate ClearRenderTargetView + RSSetViewports calls.
+// Build:
+//  - s_pBBTex  : back buffer (double-wide W*2 × H)
+//  - s_pEyeTex : two W×H staging textures (cleared per-eye each frame)
+//  - s_pEyeRTV : one RTV per staging texture
+// CopySubresourceRegion (ctx vtable 46) copies each into its half of the BB.
+// ID3D11Device vtable: 5=CreateTexture2D  9=CreateRenderTargetView
+//                      40=GetImmediateContext
 static bool d3d11BuildRTV() {
-    safeRelease(s_pRTV); safeRelease(s_pBBTex);
+    safeRelease(s_pEyeRTV[0]); safeRelease(s_pEyeRTV[1]);
+    safeRelease(s_pEyeTex[0]); safeRelease(s_pEyeTex[1]);
+    safeRelease(s_pBBTex);
     if(!s_pD3DDev||!s_pDXGISC) return false;
     if(!s_pD3DCtx) vcall<40,void>(s_pD3DDev,(IUnknown**)&s_pD3DCtx);
+
+    // Grab the double-wide back buffer (used as copy destination only)
     HRESULT hr=vcall<9>(s_pDXGISC,(UINT)0,&s_iidTex2D,(void**)&s_pBBTex);
     log("  GetBuffer: hr=0x%x  tex=%p",(unsigned)hr,(void*)s_pBBTex);
     if(FAILED(hr)||!s_pBBTex) return false;
-    // nullptr desc → default RTV covering the whole texture, Dim=TEXTURE2D
-    hr=vcall<9>(s_pD3DDev,s_pBBTex,(void*)nullptr,(IUnknown**)&s_pRTV);
-    log("  CreateRenderTargetView: hr=0x%x  rtv=%p",(unsigned)hr,(void*)s_pRTV);
-    return SUCCEEDED(hr)&&s_pRTV;
+
+    // Create two W×H staging textures and their RTVs
+    D3D11_TEX2D_DESC_ td{};
+    td.Width=(UINT)s_dispW; td.Height=(UINT)s_dispH;
+    td.MipLevels=1; td.ArraySize=1;
+    td.Format=DFMT_B8G8R8A8;
+    td.SampleDesc={1,0};
+    td.Usage=0;                // D3D11_USAGE_DEFAULT
+    td.BindFlags=0x20;         // D3D11_BIND_RENDER_TARGET
+    for(int eye=0;eye<2;++eye){
+        hr=vcall<5>(s_pD3DDev,&td,(void*)nullptr,(IUnknown**)&s_pEyeTex[eye]);
+        log("  CreateTexture2D[%d]: hr=0x%x  tex=%p",eye,(unsigned)hr,(void*)s_pEyeTex[eye]);
+        if(FAILED(hr)||!s_pEyeTex[eye]) return false;
+        hr=vcall<9>(s_pD3DDev,s_pEyeTex[eye],(void*)nullptr,(IUnknown**)&s_pEyeRTV[eye]);
+        log("  CreateRenderTargetView[%d]: hr=0x%x  rtv=%p",eye,(unsigned)hr,(void*)s_pEyeRTV[eye]);
+        if(FAILED(hr)||!s_pEyeRTV[eye]) return false;
+    }
+    return true;
 }
 
 // Go FSE, resize buffers (preserves the double-width layout), rebuild RTV.
 static bool d3d11GoFSE() {
     log("--- Going fullscreen exclusive ---");
-    safeRelease(s_pRTV); safeRelease(s_pBBTex);
+    safeRelease(s_pEyeRTV[0]); safeRelease(s_pEyeRTV[1]);
+    safeRelease(s_pEyeTex[0]); safeRelease(s_pEyeTex[1]);
+    safeRelease(s_pBBTex);
     HRESULT hr=vcall<10>(s_pDXGISC,TRUE,(void*)nullptr);
     log("  SetFullscreenState(TRUE): hr=0x%x (%s)",(unsigned)hr,SUCCEEDED(hr)?"OK":"FAILED");
     if(FAILED(hr)) return false;
@@ -302,20 +335,46 @@ static bool d3d11GoFSE() {
 
 static void d3d11Shutdown(){
     if(s_pDXGISC){vcall<10>(s_pDXGISC,FALSE,(void*)nullptr);}
-    safeRelease(s_pRTV); safeRelease(s_pBBTex);
+    safeRelease(s_pEyeRTV[0]); safeRelease(s_pEyeRTV[1]);
+    safeRelease(s_pEyeTex[0]); safeRelease(s_pEyeTex[1]);
+    safeRelease(s_pBBTex);
     safeRelease(s_pD3DCtx); safeRelease(s_pDXGISC); safeRelease(s_pD3DDev);
     if(s_hD3D11){FreeLibrary(s_hD3D11);s_hD3D11=nullptr;}
 }
 
-// Clear a viewport-sized region of the back buffer to a solid colour.
-// OMSetRenderTargets (ctx vtable 33), RSSetViewports (44), ClearRenderTargetView (50)
-static void clearViewport(float vx, float r, float g, float b) {
-    if(!s_pD3DCtx||!s_pRTV) return;
-    float c[4]={r,g,b,1.f};
-    D3D11_VIEWPORT_ vp{vx, 0.f, (float)s_dispW, (float)s_dispH, 0.f, 1.f};
-    vcall<33,void>(s_pD3DCtx,(UINT)1,&s_pRTV,(void*)nullptr);
-    vcall<44,void>(s_pD3DCtx,(UINT)1,&vp);
-    vcall<50,void>(s_pD3DCtx,s_pRTV,c);
+// Render both eyes into the double-wide back buffer:
+//   1. ClearRenderTargetView on each W×H staging RTV (clears entire texture)
+//   2. CopySubresourceRegion copies each into the correct half of the BB
+//
+// ID3D11DeviceContext vtable:
+//   33=OMSetRenderTargets  50=ClearRenderTargetView
+//   46=CopySubresourceRegion
+//
+// CopySubresourceRegion signature:
+//   void Copy(pDst, DstSub, DstX, DstY, DstZ, pSrc, SrcSub, pSrcBox)
+//   pSrcBox=nullptr copies the entire source texture.
+static void renderEyes() {
+    if(!s_pD3DCtx||!s_pEyeRTV[0]||!s_pEyeRTV[1]||!s_pBBTex) return;
+
+    // Left eye: CYAN
+    float cyan[4]={0.f,1.f,1.f,1.f};
+    vcall<33,void>(s_pD3DCtx,(UINT)1,&s_pEyeRTV[0],(void*)nullptr);
+    vcall<50,void>(s_pD3DCtx,s_pEyeRTV[0],cyan);
+
+    // Right eye: RED
+    float red[4]={1.f,0.f,0.f,1.f};
+    vcall<33,void>(s_pD3DCtx,(UINT)1,&s_pEyeRTV[1],(void*)nullptr);
+    vcall<50,void>(s_pD3DCtx,s_pEyeRTV[1],red);
+
+    // Copy left eye into left half of double-wide back buffer (DstX=0)
+    vcall<46,void>(s_pD3DCtx,
+        s_pBBTex,      (UINT)0, (UINT)0,          (UINT)0, (UINT)0,
+        s_pEyeTex[0],  (UINT)0, (void*)nullptr);
+
+    // Copy right eye into right half of double-wide back buffer (DstX=W)
+    vcall<46,void>(s_pD3DCtx,
+        s_pBBTex,      (UINT)0, (UINT)s_dispW,    (UINT)0, (UINT)0,
+        s_pEyeTex[1],  (UINT)0, (void*)nullptr);
 }
 
 static HRESULT dxgiPresent(UINT sync){
@@ -424,7 +483,9 @@ static void runStereoLoop() {
             s_restore=false;
             log("  frame=%-6u  Restoring FSE + 3DV...",frame);
             // Release back-buffer refs before FSE transition
-            safeRelease(s_pRTV); safeRelease(s_pBBTex);
+            safeRelease(s_pEyeRTV[0]); safeRelease(s_pEyeRTV[1]);
+            safeRelease(s_pEyeTex[0]); safeRelease(s_pEyeTex[1]);
+            safeRelease(s_pBBTex);
             // Re-assert FSE
             HRESULT hr=vcall<10>(s_pDXGISC,TRUE,(void*)nullptr);
             log("  SetFullscreenState(TRUE): hr=0x%x",unsigned(hr));
@@ -440,10 +501,8 @@ static void runStereoLoop() {
             log("  Restore complete");
         }
 
-        // ── Render: left eye (CYAN) to left viewport ──────────────────────────
-        clearViewport(0.f,              0.f, 1.f, 1.f);  // CYAN
-        // ── Render: right eye (RED) to right viewport ─────────────────────────
-        clearViewport((float)s_dispW,   1.f, 0.f, 0.f);  // RED
+        // ── Render: clear eye textures and copy into double-wide back buffer ───
+        renderEyes();
 
         // ── Present ───────────────────────────────────────────────────────────
         HRESULT hr=dxgiPresent(1);
@@ -687,7 +746,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int){
     AllocConsole();
     FILE *f=nullptr; freopen_s(&f,"CONOUT$","w",stdout);
     logInit();
-    log("=== VkStereo3DVision v14 startup ===");
+    log("=== VkStereo3DVision v15 startup ===");
     logDisplayMode();
 
     s_hwnd=createFullscreenWindow(hInst);
@@ -712,7 +771,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int){
         // Activate stereo after FSE
         nvapiActivate();
 
-        if(!s_pRTV){
+        if(!s_pEyeRTV[0]||!s_pEyeRTV[1]){
             log("FATAL: no RTV");
             MessageBoxA(nullptr,"D3D11 RTV setup failed","Error",MB_OK|MB_ICONERROR);
         } else {
