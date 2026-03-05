@@ -1,62 +1,45 @@
 /*
- * vulkan_stereo_3dvision.cpp  v13
+ * vulkan_stereo_3dvision.cpp  v14
  *
  * Stereoscopic 3D – NVIDIA 3D Vision, driver 426.06 / 452.06.
  *
- * ── ROOT CAUSE FROM v12 LOG ───────────────────────────────────────────────────
+ * ── ROOT CAUSE FROM v13 LOG ───────────────────────────────────────────────────
  *
- *  NvAPI_Stereo_SetActiveEye is NEVER found across 1444 frames regardless of
- *  IsActivated state or SetDriverMode value.  It does not exist in this driver's
- *  NVAPI dispatch table.
+ *  NvAPI_Stereo_SetSurfaceCreationMode: NOT FOUND in dispatch table.
+ *  This function does not exist in 426.06's NVAPI build.
+ *  GetSurfaceCreationMode returns 0 (AUTO) confirming it was never set.
+ *  Back buffer stayed mono Texture2D.
+ *  CreateRTV(slice=1) = E_INVALIDARG — slice 1 doesn't exist on a mono surface.
  *
- *  SetDriverMode(2) succeeds.  Value 2 = NVAPI_STEREO_DRIVER_MODE_DIRECT (not
- *  MANUAL as assumed previously).  In DIRECT mode SetActiveEye is not used.
+ * ── v14 FIX: DIRECT MODE = DOUBLE-WIDTH BACK BUFFER ─────────────────────────
  *
- *  DIRECT mode requires a stereo companion surface — a Texture2DArray with
- *  ArraySize=2 where slice 0 = left eye and slice 1 = right eye.  Without
- *  calling NvAPI_Stereo_SetSurfaceCreationMode(FORCESTEREO) before swap chain
- *  creation, DXGI allocates a plain mono Texture2D back buffer and the driver
- *  has no stereo surface to write to — both eyes see the same mono buffer.
+ *  In NVAPI_STEREO_DRIVER_MODE_DIRECT (value 2), the driver does not allocate
+ *  the back buffer as stereo on its own.  Instead it expects the application to
+ *  create a swap chain with width = 2 × display width.  The left half of each
+ *  frame is the left eye, the right half is the right eye.  The driver detects
+ *  the double-width format on Present and composites both halves into the stereo
+ *  flip engine.  No SetSurfaceCreationMode, no SetActiveEye, no Texture2DArray.
  *
- * ── v13 FIX ───────────────────────────────────────────────────────────────────
+ *  Layout:
+ *    Back buffer: 3840 × 1080  (2 × 1920 for 1080p)
+ *    Viewport A:  [0,    0, 1920, 1080]  → left  eye (CYAN)
+ *    Viewport B:  [1920, 0, 1920, 1080]  → right eye (RED)
+ *    Present(syncInterval=1)
  *
- *  Correct DIRECT-mode stereo sequence:
- *    1. D3D11CreateDevice (NO swap chain yet)
- *    2. NvAPI_Stereo_CreateHandleFromIUnknown(device)
- *    3. NvAPI_Stereo_SetDriverMode(DIRECT=2)
- *    4. NvAPI_Stereo_SetSurfaceCreationMode(handle, FORCESTEREO=1)
- *           → All subsequently created surfaces will be stereo Texture2DArray[2]
- *    5. Create DXGI swap chain via IDXGIFactory::CreateSwapChain
- *           → Back buffer is now Texture2DArray, ArraySize=2
- *    6. IDXGISwapChain::SetFullscreenState(TRUE) + ResizeBuffers
- *    7. NvAPI_Stereo_Activate(handle)
- *    8. GetBuffer → Texture2DArray; create two RTVs:
- *           Left  eye: Dim=TEXTURE2DARRAY, FirstArraySlice=0, ArraySize=1
- *           Right eye: Dim=TEXTURE2DARRAY, FirstArraySlice=1, ArraySize=1
- *    9. Per frame:
- *           ClearRenderTargetView(rtvLeft,  CYAN)
- *           ClearRenderTargetView(rtvRight, RED)
- *           IDXGISwapChain::Present(1, 0)
- *       The driver composites slice0→left-eye buffer, slice1→right-eye buffer
- *       and fires the IR emitter during Present.
+ * ── AUTO-RESTORE ─────────────────────────────────────────────────────────────
  *
- * ── DXGI FACTORY PATH ────────────────────────────────────────────────────────
- *
- *  D3D11CreateDevice gives us an IUnknown (ID3D11Device).
- *  We QI → IDXGIDevice → GetAdapter → GetParent(IDXGIFactory) → CreateSwapChain.
- *  All via vtable calls, no DXGI SDK headers needed.
- *
- *  GUIDs used (not in any included header):
- *    IDXGIDevice:  {54EC77FA-1377-44E6-8C32-88FD5F44C84C}
- *    IDXGIFactory: {7B7166EC-21C7-44AE-B21A-C9AE321AE369}
+ *  WM_ACTIVATE (wParam != WA_INACTIVE) → request FSE + NVAPI re-activation.
+ *  WM_ACTIVATEAPP (wParam == TRUE)     → same.
+ *  A restore flag is set in WndProc and acted on at the top of the render loop
+ *  (COM/NVAPI calls must happen on the render thread, not the message thread).
  *
  * ── BUILD ────────────────────────────────────────────────────────────────────
  *   cl /std:c++17 /W3 /O2 main.cpp /I%VULKAN_SDK%\Include ^
  *      /link /LIBPATH:%VULKAN_SDK%\Lib vulkan-1.lib user32.lib
  *
  * ── OUTPUT ───────────────────────────────────────────────────────────────────
- *   Stereo: left=CYAN  right=RED  (3D Vision shutter glasses)
- *   Non-stereo (3DV off): CYAN fullscreen (Vulkan)
+ *   Stereo: left half=CYAN  right half=RED  → 3D Vision composites per eye
+ *   Non-stereo: CYAN fullscreen (Vulkan)
  *   Log: vulkan_stereo.log   ESC to quit.
  */
 
@@ -118,11 +101,29 @@ static void logDisplayMode() {
 // ============================================================================
 // Win32 window
 // ============================================================================
-static HWND s_hwnd=nullptr; static bool s_quit=false;
+static HWND s_hwnd     = nullptr;
+static bool s_quit     = false;
+static bool s_restore  = false;  // set by WndProc; acted on in render loop
+
 static LRESULT CALLBACK WndProc(HWND h,UINT m,WPARAM w,LPARAM l){
-    if(m==WM_DESTROY||m==WM_CLOSE){s_quit=true;PostQuitMessage(0);return 0;}
+    switch(m){
+    case WM_DESTROY:
+    case WM_CLOSE:
+        s_quit=true; PostQuitMessage(0); return 0;
+    case WM_ACTIVATE:
+        // WA_INACTIVE=0; any other value means we're being activated
+        if(LOWORD(w)!=WA_INACTIVE){ s_restore=true; log("  WM_ACTIVATE → restore requested"); }
+        break;
+    case WM_ACTIVATEAPP:
+        if(w){ s_restore=true; log("  WM_ACTIVATEAPP → restore requested"); }
+        break;
+    case WM_SETFOCUS:
+        s_restore=true;
+        break;
+    }
     return DefWindowProcA(h,m,w,l);
 }
+
 static HWND createFullscreenWindow(HINSTANCE hInst){
     WNDCLASSEXA wc{}; wc.cbSize=sizeof(wc); wc.style=CS_HREDRAW|CS_VREDRAW;
     wc.lpfnWndProc=WndProc; wc.hInstance=hInst;
@@ -151,33 +152,20 @@ typedef enum { DSE_DISCARD=0      } DXGI_SWAP_EFFECT_;
 typedef UINT DXGI_USAGE_;
 #define DXGI_USAGE_RTO 0x20u
 
-typedef struct { UINT N,D; }                DXGI_RATIONAL_;
+typedef struct { UINT N,D; }              DXGI_RATIONAL_;
 typedef struct { UINT W,H; DXGI_RATIONAL_ Refresh;
                  DXGI_FORMAT_ Fmt; UINT SLO,Scale; } DXGI_MODE_DESC_;
-typedef struct { UINT Count,Quality; }      DXGI_SAMPLE_DESC_;
+typedef struct { UINT Count,Quality; }    DXGI_SAMPLE_DESC_;
 typedef struct {
-    DXGI_MODE_DESC_    BD;
-    DXGI_SAMPLE_DESC_  SD;
-    DXGI_USAGE_        BU;
-    UINT               BC;
-    HWND               OW;
-    BOOL               Win;
-    DXGI_SWAP_EFFECT_  SE;
-    UINT               Fl;
+    DXGI_MODE_DESC_   BD;
+    DXGI_SAMPLE_DESC_ SD;
+    DXGI_USAGE_       BU;
+    UINT              BC;
+    HWND              OW;
+    BOOL              Win;
+    DXGI_SWAP_EFFECT_ SE;
+    UINT              Fl;
 } DXGI_SWAP_CHAIN_DESC_;
-
-// D3D11_RENDER_TARGET_VIEW_DESC
-// D3D11_RTV_DIMENSION: TEXTURE2D=4  TEXTURE2DARRAY=5
-typedef struct { UINT MipSlice; }                     D3D11_TEX2D_RTV_;
-typedef struct { UINT MipSlice; UINT FirstArraySlice;
-                 UINT ArraySize; }                    D3D11_TEX2DARRAY_RTV_;
-typedef struct { DXGI_FORMAT_ Fmt; UINT Dim;
-    union {
-        D3D11_TEX2D_RTV_      Tex2D;
-        D3D11_TEX2DARRAY_RTV_ Tex2DArray;
-    };
-    char pad[48];
-} D3D11_RTV_DESC_;
 
 typedef struct { FLOAT X,Y,W,H,MinZ,MaxZ; } D3D11_VIEWPORT_;
 
@@ -200,38 +188,28 @@ static R vcall(void *o,A...args){
     return ((R(__stdcall*)(void*,A...))vt[N])(o,args...);
 }
 
-// IDXGISwapChain vtable:
-//  IUnknown:0-2  IDXGIObject:3-6  IDXGIDeviceSubObject:7
-//  8=Present  9=GetBuffer  10=SetFullscreenState  11=GetFullscreenState
-//  12=GetDesc  13=ResizeBuffers
-// ID3D11Device vtable:
-//  IUnknown:0-2  then device methods from 3
-//  3=CreateBuffer  9=CreateRenderTargetView  40=GetImmediateContext
-// ID3D11DeviceContext vtable:
-//  IUnknown:0-2  ID3D11DeviceChild:3-6  context methods from 7
-//  33=OMSetRenderTargets  44=RSSetViewports  50=ClearRenderTargetView
-// IDXGIDevice vtable:
-//  IUnknown:0-2  IDXGIObject:3-6  7=GetAdapter
-// IDXGIAdapter (IDXGIObject):
-//  IUnknown:0-2  IDXGIObject:3-6 (GetParent=6)  7=EnumOutputs  8=GetDesc  9=CheckInterfaceSupport
-// IDXGIFactory vtable:
-//  IUnknown:0-2  IDXGIObject:3-6  7=EnumAdapters  8=MakeWindowAssociation
-//  9=GetWindowAssociation  10=CreateSwapChain
+// Vtable layout summary:
+//   IUnknown:            0=QI  1=AddRef  2=Release
+//   IDXGIObject:         3..6 (GetParent=6)
+//   IDXGIDeviceSubObject:7=GetDevice
+//   IDXGISwapChain:      8=Present  9=GetBuffer  10=SetFullscreenState
+//                        11=GetFullscreenState  12=GetDesc  13=ResizeBuffers
+//   IDXGIDevice:         7=GetAdapter
+//   IDXGIFactory:        10=CreateSwapChain
+//   ID3D11Device:        9=CreateRenderTargetView  40=GetImmediateContext
+//   ID3D11DeviceContext: 33=OMSetRenderTargets  44=RSSetViewports
+//                        50=ClearRenderTargetView
 
-static HMODULE   s_hD3D11     = nullptr;
-static IUnknown *s_pD3DDev    = nullptr;  // ID3D11Device
-static IUnknown *s_pDXGISC    = nullptr;  // IDXGISwapChain
-static IUnknown *s_pD3DCtx    = nullptr;  // ID3D11DeviceContext
-static IUnknown *s_pBBTex     = nullptr;  // ID3D11Texture2D back buffer
-static IUnknown *s_pRTVLeft   = nullptr;  // RTV – slice 0 (left eye)
-static IUnknown *s_pRTVRight  = nullptr;  // RTV – slice 1 (right eye)
-static bool      s_stereoSC   = false;    // swap chain is stereo Texture2DArray
-static int       s_bbW=0, s_bbH=0;
+static HMODULE   s_hD3D11   = nullptr;
+static IUnknown *s_pD3DDev  = nullptr;  // ID3D11Device
+static IUnknown *s_pDXGISC  = nullptr;  // IDXGISwapChain
+static IUnknown *s_pD3DCtx  = nullptr;  // ID3D11DeviceContext
+static IUnknown *s_pBBTex   = nullptr;  // ID3D11Texture2D back buffer
+static IUnknown *s_pRTV     = nullptr;  // single RTV (full double-width back buffer)
+static int s_dispW=0, s_dispH=0;       // display resolution (single eye)
 
 static void safeRelease(IUnknown *&p){if(p){p->Release();p=nullptr;}}
 
-// Create D3D11 device only (no swap chain).
-// Swap chain is created separately after NvAPI SetSurfaceCreationMode.
 static bool d3d11InitDevice() {
     log("--- D3D11 device init ---");
     s_hD3D11=LoadLibraryA("d3d11.dll");
@@ -248,144 +226,98 @@ static bool d3d11InitDevice() {
     return true;
 }
 
-// Create DXGI swap chain via IDXGIFactory::CreateSwapChain.
-// Must be called AFTER NvAPI_Stereo_SetSurfaceCreationMode(FORCESTEREO) so
-// that the back buffer is allocated as a stereo Texture2DArray[2].
-static bool d3d11CreateSwapChain(HWND hwnd, int w, int h) {
-    log("--- DXGI swap chain creation (via factory) ---");
+// Create swap chain with width = 2 * display width (DIRECT stereo layout).
+// The driver detects the 2:1 aspect ratio and composites left/right halves
+// as left/right eyes during Present.
+static bool d3d11CreateSwapChain(HWND hwnd) {
+    log("--- DXGI swap chain (double-width for DIRECT stereo) ---");
+    log("  back buffer: %dx%d (2x%d display width)", s_dispW*2, s_dispH, s_dispW);
 
-    // QI: ID3D11Device → IDXGIDevice (vtable 0 = QueryInterface)
     IUnknown *pDXGIDev=nullptr;
     HRESULT hr=vcall<0>(s_pD3DDev,&s_iidDXGIDev,(void**)&pDXGIDev);
     log("  QI IDXGIDevice: hr=0x%x  ptr=%p",(unsigned)hr,(void*)pDXGIDev);
     if(FAILED(hr)||!pDXGIDev) return false;
 
-    // IDXGIDevice::GetAdapter (vtable 7)
     IUnknown *pAdapter=nullptr;
     hr=vcall<7>(pDXGIDev,&pAdapter);
     pDXGIDev->Release();
     log("  GetAdapter: hr=0x%x  ptr=%p",(unsigned)hr,(void*)pAdapter);
     if(FAILED(hr)||!pAdapter) return false;
 
-    // IDXGIAdapter → IDXGIFactory via GetParent (IDXGIObject::GetParent = vtable 6)
     IUnknown *pFactory=nullptr;
     hr=vcall<6>(pAdapter,&s_iidDXGIFact,(void**)&pFactory);
     pAdapter->Release();
     log("  GetParent IDXGIFactory: hr=0x%x  ptr=%p",(unsigned)hr,(void*)pFactory);
     if(FAILED(hr)||!pFactory) return false;
 
-    // IDXGIFactory::CreateSwapChain (vtable 10)
     DXGI_SWAP_CHAIN_DESC_ scd{};
-    scd.BD.W=0; scd.BD.H=0; scd.BD.Refresh={120,1}; scd.BD.Fmt=DFMT_B8G8R8A8;
+    scd.BD.W=(UINT)(s_dispW*2); // double-width: left eye | right eye
+    scd.BD.H=(UINT)s_dispH;
+    scd.BD.Refresh={120,1};
+    scd.BD.Fmt=DFMT_B8G8R8A8;
     scd.SD={1,0};
-    scd.BU=DXGI_USAGE_RTO; scd.BC=2; scd.OW=hwnd;
-    scd.Win=TRUE;   // windowed first; go FSE after
+    scd.BU=DXGI_USAGE_RTO;
+    scd.BC=2; scd.OW=hwnd;
+    scd.Win=TRUE;  // windowed; go FSE after NVAPI setup
     scd.SE=DSE_DISCARD;
     hr=vcall<10>(pFactory,s_pD3DDev,&scd,&s_pDXGISC);
     pFactory->Release();
     log("  CreateSwapChain: hr=0x%x (%s)  sc=%p",(unsigned)hr,
         SUCCEEDED(hr)?"OK":"FAILED",(void*)s_pDXGISC);
-    if(FAILED(hr)||!s_pDXGISC) return false;
-
-    s_bbW=w; s_bbH=h;
-    return true;
+    return SUCCEEDED(hr)&&s_pDXGISC;
 }
 
-// Create left-eye and right-eye RTVs on the back buffer.
-// When SetSurfaceCreationMode(FORCESTEREO) was active, GetBuffer returns a
-// Texture2DArray with ArraySize=2.  We create one RTV per slice.
-// If the back buffer turns out to be mono (FORCESTEREO not honoured), we fall
-// back to a single RTV on both slots and log a warning.
-static bool d3d11BuildRTVs() {
-    safeRelease(s_pRTVLeft);
-    safeRelease(s_pRTVRight);
-    safeRelease(s_pBBTex);
+// Build a single RTV covering the full double-width back buffer.
+// We draw CYAN to the left viewport and RED to the right viewport
+// using two separate ClearRenderTargetView + RSSetViewports calls.
+static bool d3d11BuildRTV() {
+    safeRelease(s_pRTV); safeRelease(s_pBBTex);
     if(!s_pD3DDev||!s_pDXGISC) return false;
-
-    if(!s_pD3DCtx)
-        vcall<40,void>(s_pD3DDev,(IUnknown**)&s_pD3DCtx);
-
-    // GetBuffer(0, IID_ID3D11Texture2D)  – SC vtable 9
+    if(!s_pD3DCtx) vcall<40,void>(s_pD3DDev,(IUnknown**)&s_pD3DCtx);
     HRESULT hr=vcall<9>(s_pDXGISC,(UINT)0,&s_iidTex2D,(void**)&s_pBBTex);
     log("  GetBuffer: hr=0x%x  tex=%p",(unsigned)hr,(void*)s_pBBTex);
     if(FAILED(hr)||!s_pBBTex) return false;
-
-    // Try stereo Texture2DArray RTVs first (slice 0 = left, slice 1 = right).
-    // D3D11_RTV_DIMENSION_TEXTURE2DARRAY = 5
-    auto makeArrayRTV=[&](UINT slice, IUnknown *&out)->bool {
-        D3D11_RTV_DESC_ desc{};
-        desc.Fmt=DFMT_B8G8R8A8;
-        desc.Dim=5; // TEXTURE2DARRAY
-        desc.Tex2DArray={0, slice, 1};
-        HRESULT h=vcall<9>(s_pD3DDev,s_pBBTex,&desc,(IUnknown**)&out);
-        log("  CreateRTV(slice=%u, Dim=ARRAY): hr=0x%x  rtv=%p",slice,(unsigned)h,(void*)out);
-        return SUCCEEDED(h)&&out;
-    };
-
-    bool leftOk  = makeArrayRTV(0, s_pRTVLeft);
-    bool rightOk = makeArrayRTV(1, s_pRTVRight);
-
-    if(leftOk && rightOk){
-        s_stereoSC=true;
-        log("  Back buffer is stereo Texture2DArray – per-eye RTVs created");
-        return true;
-    }
-
-    // Fallback: back buffer is mono – FORCESTEREO not honoured.
-    // Both eyes will see the same image.
-    log("  WARNING: Array RTVs failed – back buffer appears MONO.");
-    log("  SetSurfaceCreationMode(FORCESTEREO) may not have been accepted.");
-    safeRelease(s_pRTVLeft);
-    safeRelease(s_pRTVRight);
-    s_stereoSC=false;
-
-    // Fall back to mono RTV (nullptr desc = full texture, Dim=TEXTURE2D)
-    hr=vcall<9>(s_pD3DDev,s_pBBTex,(void*)nullptr,(IUnknown**)&s_pRTVLeft);
-    s_pRTVRight=s_pRTVLeft; // same surface for both eyes
-    if(s_pRTVRight) s_pRTVRight->AddRef();
-    log("  Mono fallback RTV: hr=0x%x  rtv=%p",(unsigned)hr,(void*)s_pRTVLeft);
-    return s_pRTVLeft!=nullptr;
+    // nullptr desc → default RTV covering the whole texture, Dim=TEXTURE2D
+    hr=vcall<9>(s_pD3DDev,s_pBBTex,(void*)nullptr,(IUnknown**)&s_pRTV);
+    log("  CreateRenderTargetView: hr=0x%x  rtv=%p",(unsigned)hr,(void*)s_pRTV);
+    return SUCCEEDED(hr)&&s_pRTV;
 }
 
-// Go FSE then rebuild RTVs.
+// Go FSE, resize buffers (preserves the double-width layout), rebuild RTV.
 static bool d3d11GoFSE() {
-    if(!s_pDXGISC) return false;
     log("--- Going fullscreen exclusive ---");
-    safeRelease(s_pRTVLeft); safeRelease(s_pRTVRight); safeRelease(s_pBBTex);
-
+    safeRelease(s_pRTV); safeRelease(s_pBBTex);
     HRESULT hr=vcall<10>(s_pDXGISC,TRUE,(void*)nullptr);
     log("  SetFullscreenState(TRUE): hr=0x%x (%s)",(unsigned)hr,SUCCEEDED(hr)?"OK":"FAILED");
     if(FAILED(hr)) return false;
-
-    hr=vcall<13>(s_pDXGISC,(UINT)2,(UINT)0,(UINT)0,(int)DFMT_UNKNOWN,(UINT)0);
-    log("  ResizeBuffers: hr=0x%x (%s)",(unsigned)hr,SUCCEEDED(hr)?"OK":"FAILED");
-
-    bool ok=d3d11BuildRTVs();
-    log("  RTVs: %s  stereoSC=%s",ok?"OK":"FAILED",s_stereoSC?"YES":"NO");
+    // Pass explicit double-width; DXGI_FORMAT_UNKNOWN preserves format
+    hr=vcall<13>(s_pDXGISC,(UINT)2,(UINT)(s_dispW*2),(UINT)s_dispH,
+                 (int)DFMT_UNKNOWN,(UINT)0);
+    log("  ResizeBuffers(%dx%d): hr=0x%x (%s)",s_dispW*2,s_dispH,
+        (unsigned)hr,SUCCEEDED(hr)?"OK":"FAILED");
+    bool ok=d3d11BuildRTV();
+    log("  RTV: %s",ok?"OK":"FAILED");
     return ok;
 }
 
 static void d3d11Shutdown(){
-    if(s_pDXGISC){
-        log("  SetFullscreenState(FALSE)...");
-        vcall<10>(s_pDXGISC,FALSE,(void*)nullptr);
-    }
-    // Avoid double-release when both RTVs point to the same mono surface
-    if(s_pRTVRight && s_pRTVRight==s_pRTVLeft){s_pRTVRight->Release();s_pRTVRight=nullptr;}
-    safeRelease(s_pRTVLeft); safeRelease(s_pRTVRight);
-    safeRelease(s_pBBTex); safeRelease(s_pD3DCtx);
-    safeRelease(s_pDXGISC); safeRelease(s_pD3DDev);
+    if(s_pDXGISC){vcall<10>(s_pDXGISC,FALSE,(void*)nullptr);}
+    safeRelease(s_pRTV); safeRelease(s_pBBTex);
+    safeRelease(s_pD3DCtx); safeRelease(s_pDXGISC); safeRelease(s_pD3DDev);
     if(s_hD3D11){FreeLibrary(s_hD3D11);s_hD3D11=nullptr;}
 }
 
-static void clearRTV(IUnknown *rtv, float r,float g,float b){
-    if(!s_pD3DCtx||!rtv) return;
+// Clear a viewport-sized region of the back buffer to a solid colour.
+// OMSetRenderTargets (ctx vtable 33), RSSetViewports (44), ClearRenderTargetView (50)
+static void clearViewport(float vx, float r, float g, float b) {
+    if(!s_pD3DCtx||!s_pRTV) return;
     float c[4]={r,g,b,1.f};
-    D3D11_VIEWPORT_ vp{0.f,0.f,(float)s_bbW,(float)s_bbH,0.f,1.f};
+    D3D11_VIEWPORT_ vp{vx, 0.f, (float)s_dispW, (float)s_dispH, 0.f, 1.f};
+    vcall<33,void>(s_pD3DCtx,(UINT)1,&s_pRTV,(void*)nullptr);
     vcall<44,void>(s_pD3DCtx,(UINT)1,&vp);
-    vcall<33,void>(s_pD3DCtx,(UINT)1,&rtv,(void*)nullptr);
-    vcall<50,void>(s_pD3DCtx,rtv,c);
+    vcall<50,void>(s_pD3DCtx,s_pRTV,c);
 }
+
 static HRESULT dxgiPresent(UINT sync){
     return s_pDXGISC?vcall<8>(s_pDXGISC,sync,(UINT)0):E_FAIL;
 }
@@ -405,24 +337,19 @@ static void    *s_hStereo= nullptr;
 
 static void *nvQ(unsigned id){return s_nvQI?s_nvQI(id):nullptr;}
 
-#define NvID_Initialize              0x0150E828u
-#define NvID_Unload                  0xD22BDD7Eu
-#define NvID_Stereo_Enable           0x239C4545u
-#define NvID_Stereo_SetMode          0x5E8F0BECu  // 0=AUTO 2=DIRECT
-#define NvID_Stereo_CreateFromIUnk   0xAC7E37F4u
-#define NvID_Stereo_DestroyHandle    0x3A153134u
-#define NvID_Stereo_Activate         0xF6A1AD68u
-#define NvID_Stereo_IsActivated      0x1FB0BC30u  // (handle, *NvU8)
-#define NvID_Stereo_SetSeparation    0x5C069FA3u  // (handle, float)
-#define NvID_Stereo_GetSeparation    0xCE5729DFu  // (handle, *float)
-// NvAPI_Stereo_SetSurfaceCreationMode – called before any surface creation
-// to force stereo Texture2DArray back buffer.
-// NVAPI_STEREO_SURFACECREATEMODE: AUTO=0  FORCESTEREO=1  FORCEMONO=2
-#define NvID_Stereo_SetSurfaceCreationMode 0xF5DCFDE8u
-#define NvID_Stereo_GetSurfaceCreationMode 0x36F1C736u
+#define NvID_Initialize           0x0150E828u
+#define NvID_Unload               0xD22BDD7Eu
+#define NvID_Stereo_Enable        0x239C4545u
+#define NvID_Stereo_SetMode       0x5E8F0BECu   // 0=AUTO 2=DIRECT
+#define NvID_Stereo_CreateFromIUnk 0xAC7E37F4u
+#define NvID_Stereo_DestroyHandle 0x3A153134u
+#define NvID_Stereo_Activate      0xF6A1AD68u
+#define NvID_Stereo_IsActivated   0x1FB0BC30u   // (handle, *NvU8)
+#define NvID_Stereo_SetSeparation 0x5C069FA3u
+#define NvID_Stereo_GetSeparation 0xCE5729DFu
 
-static bool nvapiPhase1(IUnknown *pDev) {
-    log("--- NVAPI init phase 1 ---");
+static bool nvapiInit(IUnknown *pDev) {
+    log("--- NVAPI init ---");
     s_hNvapi=LoadLibraryA("nvapi64.dll");
     if(!s_hNvapi){log("  nvapi64.dll: not found"); return false;}
     s_nvQI=(PfnNvQI)GetProcAddress(s_hNvapi,"nvapi_QueryInterface");
@@ -430,13 +357,12 @@ static bool nvapiPhase1(IUnknown *pDev) {
     log("  nvapi64.dll OK");
 
     {auto fn=(PfnNvV)nvQ(NvID_Initialize);
-     if(!fn){log("  NvAPI_Initialize fn: not found"); return false;}
+     if(!fn){log("  NvAPI_Initialize: not found"); return false;}
      int r=fn(); log("  NvAPI_Initialize = %d",r); if(r)return false;}
 
     {auto fn=(PfnNvV)nvQ(NvID_Stereo_Enable);
      if(fn){int r=fn(); log("  NvAPI_Stereo_Enable = %d",r);}}
 
-    // Create handle from device
     {auto fn=(PfnNvFromIUnk)nvQ(NvID_Stereo_CreateFromIUnk);
      if(fn&&pDev){
          int r=fn(pDev,&s_hStereo);
@@ -444,49 +370,23 @@ static bool nvapiPhase1(IUnknown *pDev) {
              r,r==NVAPI_OK?"OK":"FAILED",(void*)s_hStereo);
          if(r!=NVAPI_OK) s_hStereo=nullptr;
      }}
-    if(!s_hStereo){log("  No stereo handle – aborting"); return false;}
+    if(!s_hStereo){log("  No stereo handle"); return false;}
 
-    // SetDriverMode DIRECT=2 (mode 1 returns -5, mode 2 returns 0 per v12 log)
+    // DIRECT mode (value 2 confirmed working in v12/v13)
     {typedef int(*Pfn)(unsigned); auto fn=(Pfn)nvQ(NvID_Stereo_SetMode);
      if(fn){int r=fn(2); log("  NvAPI_Stereo_SetDriverMode(DIRECT=2) = %d",r);}}
 
-    // SetSurfaceCreationMode(FORCESTEREO=1) – CRITICAL.
-    // Must be called BEFORE swap chain creation so the back buffer is
-    // allocated as a stereo Texture2DArray[2] instead of a mono Texture2D.
-    {typedef int(*Pfn)(void*,unsigned); auto fn=(Pfn)nvQ(NvID_Stereo_SetSurfaceCreationMode);
-     if(fn){
-         int r=fn(s_hStereo,1);
-         log("  NvAPI_Stereo_SetSurfaceCreationMode(FORCESTEREO=1) = %d (%s)",
-             r,r==NVAPI_OK?"OK":"FAILED/fn-absent");
-     } else {
-         log("  NvAPI_Stereo_SetSurfaceCreationMode: fn NOT FOUND in dispatch table");
-         log("  Back buffer will be MONO – per-eye rendering will not work");
-     }}
-
-    // Query current mode for confirmation
-    {typedef int(*Pfn)(void*,unsigned*); auto fn=(Pfn)nvQ(NvID_Stereo_GetSurfaceCreationMode);
-     if(fn){unsigned mode=99; fn(s_hStereo,&mode);
-            log("  NvAPI_Stereo_GetSurfaceCreationMode = %u (1=FORCESTEREO)",mode);}}
-
-    log("  Phase 1 complete  handle=%p",(void*)s_hStereo);
+    log("  NVAPI init done  handle=%p",(void*)s_hStereo);
     return true;
 }
 
-static void nvapiPhase2() {
+// Activate stereo – call after FSE is acquired (or re-acquired).
+static void nvapiActivate() {
     if(!s_hStereo) return;
-    log("--- NVAPI init phase 2 (post-FSE) ---");
-
-    {typedef int(*Pfn)(void*); auto fn=(Pfn)nvQ(NvID_Stereo_Activate);
-     if(fn){int r=fn(s_hStereo); log("  NvAPI_Stereo_Activate = %d",r);}}
-
-    {typedef int(*Pfn)(void*,unsigned char*); auto fn=(Pfn)nvQ(NvID_Stereo_IsActivated);
-     if(fn){unsigned char a=0; fn(s_hStereo,&a);
-            log("  NvAPI_Stereo_IsActivated: active=%d",(int)a);}}
-
-    {typedef int(*Pfn)(void*,float); auto fn=(Pfn)nvQ(NvID_Stereo_SetSeparation);
-     if(fn){fn(s_hStereo,50.f); log("  NvAPI_Stereo_SetSeparation(50%%) done");}}
-
-    log("  Phase 2 complete");
+    typedef int(*Pfn)(void*); auto fn=(Pfn)nvQ(NvID_Stereo_Activate);
+    if(fn){int r=fn(s_hStereo); log("  NvAPI_Stereo_Activate = %d",r);}
+    typedef int(*PfnSep)(void*,float); auto fnS=(PfnSep)nvQ(NvID_Stereo_SetSeparation);
+    if(fnS) fnS(s_hStereo,50.f);
 }
 
 static void nvapiShutdown(){
@@ -495,16 +395,13 @@ static void nvapiShutdown(){
 }
 
 // ============================================================================
-// Stereo render loop
+// Stereo render + restore loop
 // ============================================================================
 static void runStereoLoop() {
     log("--- D3D11 DIRECT stereo render loop (ESC to quit) ---");
-    log("  stereoSC=%s  rtvLeft=%p  rtvRight=%p",
-        s_stereoSC?"YES(Texture2DArray)":"NO(mono fallback)",
-        (void*)s_pRTVLeft,(void*)s_pRTVRight);
-    if(!s_stereoSC)
-        log("  WARNING: no stereo surface – both eyes will show the same image");
-    log("  Slice-0 (left)=CYAN   Slice-1 (right)=RED");
+    log("  Back buffer: %dx%d  Left=[0..%d] CYAN  Right=[%d..%d] RED",
+        s_dispW*2, s_dispH, s_dispW-1, s_dispW, s_dispW*2-1);
+    log("  Alt+Tab / click window to restore FSE+3DV");
 
     typedef int(*PfnIA)(void*,unsigned char*); auto fnIA=(PfnIA)nvQ(NvID_Stereo_IsActivated);
     typedef int(*PfnGS)(void*,float*);          auto fnGS=(PfnGS)nvQ(NvID_Stereo_GetSeparation);
@@ -513,37 +410,62 @@ static void runStereoLoop() {
     bool wasActivated=false;
     uint32_t frame=0;
     MSG msg{};
+
     while(!s_quit){
+        // ── Message pump ─────────────────────────────────────────────────────
         while(PeekMessageA(&msg,nullptr,0,0,PM_REMOVE)){
             if(msg.message==WM_KEYDOWN&&msg.wParam==VK_ESCAPE) s_quit=true;
             TranslateMessage(&msg); DispatchMessageA(&msg);
         }
         if(s_quit) break;
 
-        // Left eye: CYAN → slice 0
-        clearRTV(s_pRTVLeft,  0.f,1.f,1.f);
-        // Right eye: RED  → slice 1
-        clearRTV(s_pRTVRight, 1.f,0.f,0.f);
+        // ── FSE / stereo restore on focus regain ─────────────────────────────
+        if(s_restore){
+            s_restore=false;
+            log("  frame=%-6u  Restoring FSE + 3DV...",frame);
+            // Release back-buffer refs before FSE transition
+            safeRelease(s_pRTV); safeRelease(s_pBBTex);
+            // Re-assert FSE
+            HRESULT hr=vcall<10>(s_pDXGISC,TRUE,(void*)nullptr);
+            log("  SetFullscreenState(TRUE): hr=0x%x",unsigned(hr));
+            // Resize to double-width (no-op if already correct size)
+            vcall<13>(s_pDXGISC,(UINT)2,(UINT)(s_dispW*2),(UINT)s_dispH,
+                      (int)DFMT_UNKNOWN,(UINT)0);
+            // Rebuild RTV on new back buffer
+            if(!d3d11BuildRTV())
+                log("  WARNING: RTV rebuild failed after restore");
+            // Re-activate stereo
+            nvapiActivate();
+            SetForegroundWindow(s_hwnd); BringWindowToTop(s_hwnd);
+            log("  Restore complete");
+        }
 
+        // ── Render: left eye (CYAN) to left viewport ──────────────────────────
+        clearViewport(0.f,              0.f, 1.f, 1.f);  // CYAN
+        // ── Render: right eye (RED) to right viewport ─────────────────────────
+        clearViewport((float)s_dispW,   1.f, 0.f, 0.f);  // RED
+
+        // ── Present ───────────────────────────────────────────────────────────
         HRESULT hr=dxgiPresent(1);
+
         ++frame;
 
-        // Monitor activation state
+        // ── Activation monitor: re-activate if stereo drops ──────────────────
         unsigned char active=0;
         if(fnIA) fnIA(s_hStereo,&active);
-        if(active&&!wasActivated){
+        if(active && !wasActivated){
             wasActivated=true;
-            log("  frame=%-6u *** IsActivated 0→1 ***",frame);
+            log("  frame=%-6u  *** IsActivated 0→1 (3DV live) ***",frame);
         }
-        if(!active&&wasActivated){
+        if(!active && wasActivated){
             wasActivated=false;
             log("  frame=%-6u  IsActivated 1→0 – re-activating",frame);
             if(fnAct) fnAct(s_hStereo);
         }
 
+        // ── Periodic diagnostic ───────────────────────────────────────────────
         if(frame==1||frame%120==0){
-            float sep=0.f;
-            if(fnGS) fnGS(s_hStereo,&sep);
+            float sep=0.f; if(fnGS) fnGS(s_hStereo,&sep);
             log("  frame=%-6u  present=0x%x  activated=%d  sep=%.1f%%",
                 frame,(unsigned)hr,(int)active,sep);
         }
@@ -708,7 +630,7 @@ struct VkApp {
             VK_CHECK(vkCreateSemaphore(device,&si,nullptr,&renDone[i]));
             VK_CHECK(vkCreateFence(device,&fci,nullptr,&inFlt[i]));
         }
-        log("=== Vulkan init complete: %ux%u  %u images ===",swapExtent.width,swapExtent.height,swapCount);
+        log("=== Vulkan init: %ux%u  %u images ===",swapExtent.width,swapExtent.height,swapCount);
     }
     void drawFrame(){
         vkWaitForFences(device,1,&inFlt[fi],VK_TRUE,UINT64_MAX);
@@ -765,43 +687,43 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int){
     AllocConsole();
     FILE *f=nullptr; freopen_s(&f,"CONOUT$","w",stdout);
     logInit();
-    log("=== VkStereo3DVision v13 startup ===");
+    log("=== VkStereo3DVision v14 startup ===");
     logDisplayMode();
 
     s_hwnd=createFullscreenWindow(hInst);
-    int sw=GetSystemMetrics(SM_CXSCREEN), sh=GetSystemMetrics(SM_CYSCREEN);
+    s_dispW=GetSystemMetrics(SM_CXSCREEN);
+    s_dispH=GetSystemMetrics(SM_CYSCREEN);
 
-    // ── D3D11 device (no swap chain yet) ─────────────────────────────────────
+    // D3D11 device (no swap chain yet)
     bool d3dOk=d3d11InitDevice();
 
-    // ── NVAPI phase 1: handle + SetDriverMode(DIRECT) + SetSurfaceCreationMode(FORCESTEREO)
-    //    Must happen BEFORE swap chain creation so back buffer is stereo array
-    bool nvapiOk = d3dOk && nvapiPhase1(s_pD3DDev);
+    // NVAPI: enable stereo, create handle, set DIRECT mode
+    // Must happen before swap chain so driver knows this is a stereo process
+    bool nvapiOk = d3dOk && nvapiInit(s_pD3DDev);
     bool stereoMode = (s_hStereo != nullptr);
     log("  D3D11=%s  NVAPI=%s  stereoMode=%s",
         d3dOk?"OK":"FAIL", nvapiOk?"OK":"FAIL", stereoMode?"YES":"NO");
 
     if(stereoMode){
-        // ── Create DXGI swap chain after NVAPI setup ─────────────────────────
-        bool scOk = d3d11CreateSwapChain(s_hwnd, sw, sh);
-
-        // ── Go FSE + build stereo RTVs ────────────────────────────────────────
+        // Create double-width swap chain
+        bool scOk = d3d11CreateSwapChain(s_hwnd);
+        // Go FSE + build RTV
         bool fseOk = scOk && d3d11GoFSE();
+        // Activate stereo after FSE
+        nvapiActivate();
 
-        // ── NVAPI phase 2: Activate (post-FSE) ───────────────────────────────
-        nvapiPhase2();
-
-        if(!s_pRTVLeft){
+        if(!s_pRTV){
             log("FATAL: no RTV");
             MessageBoxA(nullptr,"D3D11 RTV setup failed","Error",MB_OK|MB_ICONERROR);
         } else {
+            // Clear the restore flag that was set during init window messages
+            s_restore=false;
             runStereoLoop();
         }
         nvapiShutdown();
         d3d11Shutdown();
     } else {
-        d3d11Shutdown();
-        nvapiShutdown();
+        d3d11Shutdown(); nvapiShutdown();
         VkApp app{};
         try{
             app.init(hInst,s_hwnd);
