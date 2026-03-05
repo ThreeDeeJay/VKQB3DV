@@ -1,40 +1,55 @@
 /*
- * vulkan_stereo_3dvision.cpp  v15
+ * vulkan_stereo_3dvision.cpp  v16
  *
  * Stereoscopic 3D – NVIDIA 3D Vision, driver 426.06 / 452.06.
  *
- * ── ROOT CAUSE FROM v14 LOG ───────────────────────────────────────────────────
+ * ── HISTORY ──────────────────────────────────────────────────────────────────
  *
- *  Both eyes showed RED.  ClearRenderTargetView IGNORES the viewport/scissor
- *  state — it always clears the ENTIRE render target.  Setting RSSetViewports
- *  to the left half before clearing has no effect.  The right-eye RED clear
- *  therefore overwrote the full double-width back buffer including the left
- *  half every frame.
+ *  v14: Double-width (3840×1080) swap chain, NVAPI_STEREO_DRIVER_MODE_DIRECT=2.
+ *       Both eyes saw same frame; RTSS OSD squashed horizontally.
+ *       Root cause: driver treats the buffer as a plain widescreen image and
+ *       downscales it.  DIRECT mode requires NvAPI_Stereo_SetSurfaceCreationMode
+ *       (FORCESTEREO) to register the double-wide layout — but that function is
+ *       NOT in this driver's NVAPI dispatch table.  Without it the driver never
+ *       learns the buffer is a stereo pair.
  *
- * ── v15 FIX ───────────────────────────────────────────────────────────────────
+ * ── v16 FIX: ReverseStereoBlitControl ────────────────────────────────────────
  *
- *  Two separate W×H textures (eyeLeft, eyeRight) with their own RTVs.
- *  ClearRenderTargetView on each fills the full W×H texture with one colour.
- *  CopySubresourceRegion copies each texture into the correct half of the
- *  double-width back buffer:
- *    eyeLeft  (CYAN) → back buffer at DstX=0
- *    eyeRight (RED)  → back buffer at DstX=W
- *  No shaders, no pipeline state, no draw calls.
+ *  NvAPI_Stereo_ReverseStereoBlitControl (ID 0x3CD58F89) is a function that
+ *  exists in older NVAPI builds.  When enabled around a CopyResource call, the
+ *  driver intercepts the copy and treats the source as a stereo pair:
+ *    left  half of source → left  eye buffer
+ *    right half of source → right eye buffer
+ *
+ *  Sequence per frame:
+ *    1. ClearRTV(eyeLeft,  CYAN) on a W×H staging texture
+ *    2. ClearRTV(eyeRight, RED)  on a second W×H staging texture
+ *    3. CopySubresourceRegion: eyeLeft  → stereoSrc at (0,   0)
+ *    4. CopySubresourceRegion: eyeRight → stereoSrc at (W,   0)
+ *       stereoSrc is now 2W×H with left|right layout
+ *    5. NvAPI_Stereo_ReverseStereoBlitControl(handle, TRUE)
+ *    6. CopyResource(backBuffer, stereoSrc)
+ *       Driver intercepts: routes left half → left eye, right half → right eye
+ *    7. NvAPI_Stereo_ReverseStereoBlitControl(handle, FALSE)
+ *    8. Present(1)
+ *
+ *  Swap chain is standard W×H (1920×1080) — no double-wide display mode,
+ *  no SetSurfaceCreationMode, no SetActiveEye required.
+ *  SetDriverMode: AUTO (0) — the driver must own the stereo interception path.
  *
  * ── AUTO-RESTORE ─────────────────────────────────────────────────────────────
  *
- *  WM_ACTIVATE (wParam != WA_INACTIVE) → request FSE + NVAPI re-activation.
- *  WM_ACTIVATEAPP (wParam == TRUE)     → same.
- *  A restore flag is set in WndProc and acted on at the top of the render loop
- *  (COM/NVAPI calls must happen on the render thread, not the message thread).
+ *  WM_ACTIVATE / WM_ACTIVATEAPP / WM_SETFOCUS → set s_restore flag.
+ *  Render loop re-acquires FSE and calls NvAPI_Stereo_Activate at the top
+ *  of the next iteration.
  *
  * ── BUILD ────────────────────────────────────────────────────────────────────
  *   cl /std:c++17 /W3 /O2 main.cpp /I%VULKAN_SDK%\Include ^
  *      /link /LIBPATH:%VULKAN_SDK%\Lib vulkan-1.lib user32.lib
  *
  * ── OUTPUT ───────────────────────────────────────────────────────────────────
- *   Stereo: left half=CYAN  right half=RED  → 3D Vision composites per eye
- *   Non-stereo: CYAN fullscreen (Vulkan)
+ *   Stereo: left=CYAN  right=RED  (3D Vision shutter glasses)
+ *   Non-stereo (3DV off): CYAN fullscreen (Vulkan)
  *   Log: vulkan_stereo.log   ESC to quit.
  */
 
@@ -96,29 +111,25 @@ static void logDisplayMode() {
 // ============================================================================
 // Win32 window
 // ============================================================================
-static HWND s_hwnd     = nullptr;
-static bool s_quit     = false;
-static bool s_restore  = false;  // set by WndProc; acted on in render loop
+static HWND s_hwnd    = nullptr;
+static bool s_quit    = false;
+static bool s_restore = false;
 
 static LRESULT CALLBACK WndProc(HWND h,UINT m,WPARAM w,LPARAM l){
     switch(m){
-    case WM_DESTROY:
-    case WM_CLOSE:
+    case WM_DESTROY: case WM_CLOSE:
         s_quit=true; PostQuitMessage(0); return 0;
     case WM_ACTIVATE:
-        // WA_INACTIVE=0; any other value means we're being activated
-        if(LOWORD(w)!=WA_INACTIVE){ s_restore=true; log("  WM_ACTIVATE → restore requested"); }
+        if(LOWORD(w)!=WA_INACTIVE){ s_restore=true; log("  WM_ACTIVATE → restore"); }
         break;
     case WM_ACTIVATEAPP:
-        if(w){ s_restore=true; log("  WM_ACTIVATEAPP → restore requested"); }
+        if(w){ s_restore=true; log("  WM_ACTIVATEAPP → restore"); }
         break;
     case WM_SETFOCUS:
-        s_restore=true;
-        break;
+        s_restore=true; break;
     }
     return DefWindowProcA(h,m,w,l);
 }
-
 static HWND createFullscreenWindow(HINSTANCE hInst){
     WNDCLASSEXA wc{}; wc.cbSize=sizeof(wc); wc.style=CS_HREDRAW|CS_VREDRAW;
     wc.lpfnWndProc=WndProc; wc.hInstance=hInst;
@@ -162,8 +173,9 @@ typedef struct {
     UINT              Fl;
 } DXGI_SWAP_CHAIN_DESC_;
 
-// D3D11_TEXTURE2D_DESC (CreateTexture2D = ID3D11Device vtable 5)
-// D3D11_USAGE: DEFAULT=0   D3D11_BIND_RENDER_TARGET=0x20
+// D3D11_TEXTURE2D_DESC
+// D3D11_USAGE: DEFAULT=0
+// D3D11_BIND: RENDER_TARGET=0x20  SHADER_RESOURCE=0x8
 typedef struct {
     UINT Width, Height, MipLevels, ArraySize;
     DXGI_FORMAT_ Format;
@@ -171,14 +183,9 @@ typedef struct {
     UINT Usage, BindFlags, CPUAccessFlags, MiscFlags;
 } D3D11_TEX2D_DESC_;
 
-// D3D11_BOX (pass nullptr to CopySubresourceRegion for whole texture)
-typedef struct { UINT left,top,front,right,bottom,back; } D3D11_BOX_;
-
-// IID_ID3D11Texture2D
+// IIDs
 static const GUID s_iidTex2D    = {0x6F15AAF2,0xD208,0x4E89,{0x9A,0xB4,0x48,0x95,0x35,0xD3,0x4F,0x9C}};
-// IID_IDXGIDevice  {54EC77FA-1377-44E6-8C32-88FD5F44C84C}
 static const GUID s_iidDXGIDev  = {0x54EC77FA,0x1377,0x44E6,{0x8C,0x32,0x88,0xFD,0x5F,0x44,0xC8,0x4C}};
-// IID_IDXGIFactory {7B7166EC-21C7-44AE-B21A-C9AE321AE369}
 static const GUID s_iidDXGIFact = {0x7B7166EC,0x21C7,0x44AE,{0xB2,0x1A,0xC9,0xAE,0x32,0x1A,0xE3,0x69}};
 
 typedef HRESULT(WINAPI *PfnD3D11CreateDevice)(
@@ -193,26 +200,27 @@ static R vcall(void *o,A...args){
     return ((R(__stdcall*)(void*,A...))vt[N])(o,args...);
 }
 
-// Vtable layout summary:
-//   IUnknown:            0=QI  1=AddRef  2=Release
-//   IDXGIObject:         3..6 (GetParent=6)
-//   IDXGIDeviceSubObject:7=GetDevice
+// Vtable indices used:
+//   IUnknown:            0=QI  2=Release
+//   IDXGIObject:         6=GetParent
 //   IDXGISwapChain:      8=Present  9=GetBuffer  10=SetFullscreenState
-//                        11=GetFullscreenState  12=GetDesc  13=ResizeBuffers
+//                        13=ResizeBuffers
 //   IDXGIDevice:         7=GetAdapter
 //   IDXGIFactory:        10=CreateSwapChain
-//   ID3D11Device:        9=CreateRenderTargetView  40=GetImmediateContext
-//   ID3D11DeviceContext: 33=OMSetRenderTargets  44=RSSetViewports
-//                        50=ClearRenderTargetView
+//   ID3D11Device:        5=CreateTexture2D  9=CreateRenderTargetView
+//                        40=GetImmediateContext
+//   ID3D11DeviceContext: 33=OMSetRenderTargets  46=CopySubresourceRegion
+//                        47=CopyResource  50=ClearRenderTargetView
 
-static HMODULE   s_hD3D11   = nullptr;
-static IUnknown *s_pD3DDev  = nullptr;  // ID3D11Device
-static IUnknown *s_pDXGISC  = nullptr;  // IDXGISwapChain
-static IUnknown *s_pD3DCtx      = nullptr;  // ID3D11DeviceContext
-static IUnknown *s_pBBTex       = nullptr;  // ID3D11Texture2D back buffer (double-wide)
-static IUnknown *s_pEyeTex[2]   = {};       // W×H per-eye staging textures
-static IUnknown *s_pEyeRTV[2]   = {};       // RTVs on the staging textures
-static int s_dispW=0, s_dispH=0;            // display resolution (single eye)
+static HMODULE   s_hD3D11     = nullptr;
+static IUnknown *s_pD3DDev    = nullptr;  // ID3D11Device
+static IUnknown *s_pDXGISC    = nullptr;  // IDXGISwapChain (W×H)
+static IUnknown *s_pD3DCtx    = nullptr;  // ID3D11DeviceContext
+static IUnknown *s_pBBTex     = nullptr;  // back buffer Texture2D (W×H)
+static IUnknown *s_pEyeTex[2] = {};       // W×H per-eye staging textures
+static IUnknown *s_pEyeRTV[2] = {};       // RTVs on staging textures
+static IUnknown *s_pStereoSrc = nullptr;  // 2W×H source texture for reverse blit
+static int       s_dispW=0, s_dispH=0;
 
 static void safeRelease(IUnknown *&p){if(p){p->Release();p=nullptr;}}
 
@@ -232,40 +240,26 @@ static bool d3d11InitDevice() {
     return true;
 }
 
-// Create swap chain with width = 2 * display width (DIRECT stereo layout).
-// The driver detects the 2:1 aspect ratio and composites left/right halves
-// as left/right eyes during Present.
+// Create W×H swap chain (normal size — driver does the stereo split internally)
 static bool d3d11CreateSwapChain(HWND hwnd) {
-    log("--- DXGI swap chain (double-width for DIRECT stereo) ---");
-    log("  back buffer: %dx%d (2x%d display width)", s_dispW*2, s_dispH, s_dispW);
-
+    log("--- DXGI swap chain (%dx%d normal size) ---", s_dispW, s_dispH);
     IUnknown *pDXGIDev=nullptr;
     HRESULT hr=vcall<0>(s_pD3DDev,&s_iidDXGIDev,(void**)&pDXGIDev);
-    log("  QI IDXGIDevice: hr=0x%x  ptr=%p",(unsigned)hr,(void*)pDXGIDev);
-    if(FAILED(hr)||!pDXGIDev) return false;
+    if(FAILED(hr)||!pDXGIDev){log("  QI IDXGIDevice FAILED: hr=0x%x",(unsigned)hr); return false;}
 
     IUnknown *pAdapter=nullptr;
-    hr=vcall<7>(pDXGIDev,&pAdapter);
-    pDXGIDev->Release();
-    log("  GetAdapter: hr=0x%x  ptr=%p",(unsigned)hr,(void*)pAdapter);
-    if(FAILED(hr)||!pAdapter) return false;
+    hr=vcall<7>(pDXGIDev,&pAdapter); pDXGIDev->Release();
+    if(FAILED(hr)||!pAdapter){log("  GetAdapter FAILED: hr=0x%x",(unsigned)hr); return false;}
 
     IUnknown *pFactory=nullptr;
-    hr=vcall<6>(pAdapter,&s_iidDXGIFact,(void**)&pFactory);
-    pAdapter->Release();
-    log("  GetParent IDXGIFactory: hr=0x%x  ptr=%p",(unsigned)hr,(void*)pFactory);
-    if(FAILED(hr)||!pFactory) return false;
+    hr=vcall<6>(pAdapter,&s_iidDXGIFact,(void**)&pFactory); pAdapter->Release();
+    if(FAILED(hr)||!pFactory){log("  GetParent IDXGIFactory FAILED: hr=0x%x",(unsigned)hr); return false;}
 
     DXGI_SWAP_CHAIN_DESC_ scd{};
-    scd.BD.W=(UINT)(s_dispW*2); // double-width: left eye | right eye
-    scd.BD.H=(UINT)s_dispH;
-    scd.BD.Refresh={120,1};
-    scd.BD.Fmt=DFMT_B8G8R8A8;
-    scd.SD={1,0};
-    scd.BU=DXGI_USAGE_RTO;
-    scd.BC=2; scd.OW=hwnd;
-    scd.Win=TRUE;  // windowed; go FSE after NVAPI setup
-    scd.SE=DSE_DISCARD;
+    scd.BD.W=(UINT)s_dispW; scd.BD.H=(UINT)s_dispH;
+    scd.BD.Refresh={120,1}; scd.BD.Fmt=DFMT_B8G8R8A8;
+    scd.SD={1,0}; scd.BU=DXGI_USAGE_RTO; scd.BC=2; scd.OW=hwnd;
+    scd.Win=TRUE; scd.SE=DSE_DISCARD;
     hr=vcall<10>(pFactory,s_pD3DDev,&scd,&s_pDXGISC);
     pFactory->Release();
     log("  CreateSwapChain: hr=0x%x (%s)  sc=%p",(unsigned)hr,
@@ -273,108 +267,71 @@ static bool d3d11CreateSwapChain(HWND hwnd) {
     return SUCCEEDED(hr)&&s_pDXGISC;
 }
 
-// Build a single RTV covering the full double-width back buffer.
-// We draw CYAN to the left viewport and RED to the right viewport
-// using two separate ClearRenderTargetView + RSSetViewports calls.
-// Build:
-//  - s_pBBTex  : back buffer (double-wide W*2 × H)
-//  - s_pEyeTex : two W×H staging textures (cleared per-eye each frame)
-//  - s_pEyeRTV : one RTV per staging texture
-// CopySubresourceRegion (ctx vtable 46) copies each into its half of the BB.
-// ID3D11Device vtable: 5=CreateTexture2D  9=CreateRenderTargetView
-//                      40=GetImmediateContext
-static bool d3d11BuildRTV() {
+// Create/recreate all textures and RTVs after FSE transition.
+// Textures:
+//   s_pEyeTex[0/1] : W×H  – one per eye, cleared with solid colour each frame
+//   s_pStereoSrc   : 2W×H – left|right assembled here before the reverse blit
+//   s_pBBTex       : W×H  – the actual swap chain back buffer (copy destination)
+static bool d3d11BuildTextures() {
     safeRelease(s_pEyeRTV[0]); safeRelease(s_pEyeRTV[1]);
     safeRelease(s_pEyeTex[0]); safeRelease(s_pEyeTex[1]);
-    safeRelease(s_pBBTex);
+    safeRelease(s_pStereoSrc); safeRelease(s_pBBTex);
     if(!s_pD3DDev||!s_pDXGISC) return false;
     if(!s_pD3DCtx) vcall<40,void>(s_pD3DDev,(IUnknown**)&s_pD3DCtx);
 
-    // Grab the double-wide back buffer (used as copy destination only)
+    // Back buffer (copy destination – no RTV needed)
     HRESULT hr=vcall<9>(s_pDXGISC,(UINT)0,&s_iidTex2D,(void**)&s_pBBTex);
     log("  GetBuffer: hr=0x%x  tex=%p",(unsigned)hr,(void*)s_pBBTex);
     if(FAILED(hr)||!s_pBBTex) return false;
 
-    // Create two W×H staging textures and their RTVs
     D3D11_TEX2D_DESC_ td{};
+    td.MipLevels=1; td.ArraySize=1; td.Format=DFMT_B8G8R8A8;
+    td.SampleDesc={1,0}; td.Usage=0; td.BindFlags=0x20; // RENDER_TARGET
+
+    // Per-eye W×H staging textures
     td.Width=(UINT)s_dispW; td.Height=(UINT)s_dispH;
-    td.MipLevels=1; td.ArraySize=1;
-    td.Format=DFMT_B8G8R8A8;
-    td.SampleDesc={1,0};
-    td.Usage=0;                // D3D11_USAGE_DEFAULT
-    td.BindFlags=0x20;         // D3D11_BIND_RENDER_TARGET
-    for(int eye=0;eye<2;++eye){
-        hr=vcall<5>(s_pD3DDev,&td,(void*)nullptr,(IUnknown**)&s_pEyeTex[eye]);
-        log("  CreateTexture2D[%d]: hr=0x%x  tex=%p",eye,(unsigned)hr,(void*)s_pEyeTex[eye]);
-        if(FAILED(hr)||!s_pEyeTex[eye]) return false;
-        hr=vcall<9>(s_pD3DDev,s_pEyeTex[eye],(void*)nullptr,(IUnknown**)&s_pEyeRTV[eye]);
-        log("  CreateRenderTargetView[%d]: hr=0x%x  rtv=%p",eye,(unsigned)hr,(void*)s_pEyeRTV[eye]);
-        if(FAILED(hr)||!s_pEyeRTV[eye]) return false;
+    for(int e=0;e<2;++e){
+        hr=vcall<5>(s_pD3DDev,&td,(void*)nullptr,(IUnknown**)&s_pEyeTex[e]);
+        log("  CreateTexture2D[%d] W×H: hr=0x%x  tex=%p",e,(unsigned)hr,(void*)s_pEyeTex[e]);
+        if(FAILED(hr)||!s_pEyeTex[e]) return false;
+        hr=vcall<9>(s_pD3DDev,s_pEyeTex[e],(void*)nullptr,(IUnknown**)&s_pEyeRTV[e]);
+        log("  CreateRTV[%d]: hr=0x%x  rtv=%p",e,(unsigned)hr,(void*)s_pEyeRTV[e]);
+        if(FAILED(hr)||!s_pEyeRTV[e]) return false;
     }
+
+    // 2W×H source texture for the reverse blit copy
+    // Needs D3D11_BIND_RENDER_TARGET only (no shader resource needed)
+    td.Width=(UINT)(s_dispW*2); td.Height=(UINT)s_dispH;
+    td.BindFlags=0x20; // RENDER_TARGET (driver copies from this)
+    hr=vcall<5>(s_pD3DDev,&td,(void*)nullptr,(IUnknown**)&s_pStereoSrc);
+    log("  CreateTexture2D 2W×H (stereo src): hr=0x%x  tex=%p",(unsigned)hr,(void*)s_pStereoSrc);
+    if(FAILED(hr)||!s_pStereoSrc) return false;
+
     return true;
 }
 
-// Go FSE, resize buffers (preserves the double-width layout), rebuild RTV.
 static bool d3d11GoFSE() {
     log("--- Going fullscreen exclusive ---");
     safeRelease(s_pEyeRTV[0]); safeRelease(s_pEyeRTV[1]);
     safeRelease(s_pEyeTex[0]); safeRelease(s_pEyeTex[1]);
-    safeRelease(s_pBBTex);
+    safeRelease(s_pStereoSrc); safeRelease(s_pBBTex);
     HRESULT hr=vcall<10>(s_pDXGISC,TRUE,(void*)nullptr);
     log("  SetFullscreenState(TRUE): hr=0x%x (%s)",(unsigned)hr,SUCCEEDED(hr)?"OK":"FAILED");
     if(FAILED(hr)) return false;
-    // Pass explicit double-width; DXGI_FORMAT_UNKNOWN preserves format
-    hr=vcall<13>(s_pDXGISC,(UINT)2,(UINT)(s_dispW*2),(UINT)s_dispH,
-                 (int)DFMT_UNKNOWN,(UINT)0);
-    log("  ResizeBuffers(%dx%d): hr=0x%x (%s)",s_dispW*2,s_dispH,
-        (unsigned)hr,SUCCEEDED(hr)?"OK":"FAILED");
-    bool ok=d3d11BuildRTV();
-    log("  RTV: %s",ok?"OK":"FAILED");
+    hr=vcall<13>(s_pDXGISC,(UINT)2,(UINT)s_dispW,(UINT)s_dispH,(int)DFMT_UNKNOWN,(UINT)0);
+    log("  ResizeBuffers: hr=0x%x (%s)",(unsigned)hr,SUCCEEDED(hr)?"OK":"FAILED");
+    bool ok=d3d11BuildTextures();
+    log("  Textures: %s",ok?"OK":"FAILED");
     return ok;
 }
 
 static void d3d11Shutdown(){
-    if(s_pDXGISC){vcall<10>(s_pDXGISC,FALSE,(void*)nullptr);}
+    if(s_pDXGISC) vcall<10>(s_pDXGISC,FALSE,(void*)nullptr);
     safeRelease(s_pEyeRTV[0]); safeRelease(s_pEyeRTV[1]);
     safeRelease(s_pEyeTex[0]); safeRelease(s_pEyeTex[1]);
-    safeRelease(s_pBBTex);
+    safeRelease(s_pStereoSrc); safeRelease(s_pBBTex);
     safeRelease(s_pD3DCtx); safeRelease(s_pDXGISC); safeRelease(s_pD3DDev);
     if(s_hD3D11){FreeLibrary(s_hD3D11);s_hD3D11=nullptr;}
-}
-
-// Render both eyes into the double-wide back buffer:
-//   1. ClearRenderTargetView on each W×H staging RTV (clears entire texture)
-//   2. CopySubresourceRegion copies each into the correct half of the BB
-//
-// ID3D11DeviceContext vtable:
-//   33=OMSetRenderTargets  50=ClearRenderTargetView
-//   46=CopySubresourceRegion
-//
-// CopySubresourceRegion signature:
-//   void Copy(pDst, DstSub, DstX, DstY, DstZ, pSrc, SrcSub, pSrcBox)
-//   pSrcBox=nullptr copies the entire source texture.
-static void renderEyes() {
-    if(!s_pD3DCtx||!s_pEyeRTV[0]||!s_pEyeRTV[1]||!s_pBBTex) return;
-
-    // Left eye: CYAN
-    float cyan[4]={0.f,1.f,1.f,1.f};
-    vcall<33,void>(s_pD3DCtx,(UINT)1,&s_pEyeRTV[0],(void*)nullptr);
-    vcall<50,void>(s_pD3DCtx,s_pEyeRTV[0],cyan);
-
-    // Right eye: RED
-    float red[4]={1.f,0.f,0.f,1.f};
-    vcall<33,void>(s_pD3DCtx,(UINT)1,&s_pEyeRTV[1],(void*)nullptr);
-    vcall<50,void>(s_pD3DCtx,s_pEyeRTV[1],red);
-
-    // Copy left eye into left half of double-wide back buffer (DstX=0)
-    vcall<46,void>(s_pD3DCtx,
-        s_pBBTex,      (UINT)0, (UINT)0,          (UINT)0, (UINT)0,
-        s_pEyeTex[0],  (UINT)0, (void*)nullptr);
-
-    // Copy right eye into right half of double-wide back buffer (DstX=W)
-    vcall<46,void>(s_pD3DCtx,
-        s_pBBTex,      (UINT)0, (UINT)s_dispW,    (UINT)0, (UINT)0,
-        s_pEyeTex[1],  (UINT)0, (void*)nullptr);
 }
 
 static HRESULT dxgiPresent(UINT sync){
@@ -399,13 +356,22 @@ static void *nvQ(unsigned id){return s_nvQI?s_nvQI(id):nullptr;}
 #define NvID_Initialize           0x0150E828u
 #define NvID_Unload               0xD22BDD7Eu
 #define NvID_Stereo_Enable        0x239C4545u
-#define NvID_Stereo_SetMode       0x5E8F0BECu   // 0=AUTO 2=DIRECT
+#define NvID_Stereo_SetMode       0x5E8F0BECu   // 0=AUTO  2=DIRECT
 #define NvID_Stereo_CreateFromIUnk 0xAC7E37F4u
 #define NvID_Stereo_DestroyHandle 0x3A153134u
 #define NvID_Stereo_Activate      0xF6A1AD68u
-#define NvID_Stereo_IsActivated   0x1FB0BC30u   // (handle, *NvU8)
+#define NvID_Stereo_IsActivated   0x1FB0BC30u
 #define NvID_Stereo_SetSeparation 0x5C069FA3u
 #define NvID_Stereo_GetSeparation 0xCE5729DFu
+// NvAPI_Stereo_ReverseStereoBlitControl:
+//   When enabled (TRUE) around a CopyResource call, the driver intercepts
+//   the copy and treats the 2W×H source as a stereo pair (left|right),
+//   routing each half to the corresponding eye buffer.
+#define NvID_Stereo_ReverseBlit   0x3CD58F89u
+
+typedef int(*PfnRSBC)(void*, unsigned char);  // (handle, enable)
+
+static PfnRSBC s_fnReverseBlit = nullptr;
 
 static bool nvapiInit(IUnknown *pDev) {
     log("--- NVAPI init ---");
@@ -416,7 +382,7 @@ static bool nvapiInit(IUnknown *pDev) {
     log("  nvapi64.dll OK");
 
     {auto fn=(PfnNvV)nvQ(NvID_Initialize);
-     if(!fn){log("  NvAPI_Initialize: not found"); return false;}
+     if(!fn){log("  NvAPI_Initialize fn: not found"); return false;}
      int r=fn(); log("  NvAPI_Initialize = %d",r); if(r)return false;}
 
     {auto fn=(PfnNvV)nvQ(NvID_Stereo_Enable);
@@ -431,15 +397,20 @@ static bool nvapiInit(IUnknown *pDev) {
      }}
     if(!s_hStereo){log("  No stereo handle"); return false;}
 
-    // DIRECT mode (value 2 confirmed working in v12/v13)
+    // AUTO mode (0): driver owns the stereo interception path.
+    // ReverseStereoBlitControl only works in AUTO mode.
     {typedef int(*Pfn)(unsigned); auto fn=(Pfn)nvQ(NvID_Stereo_SetMode);
-     if(fn){int r=fn(2); log("  NvAPI_Stereo_SetDriverMode(DIRECT=2) = %d",r);}}
+     if(fn){int r=fn(0); log("  NvAPI_Stereo_SetDriverMode(AUTO=0) = %d",r);}}
+
+    // Probe ReverseStereoBlitControl
+    s_fnReverseBlit=(PfnRSBC)nvQ(NvID_Stereo_ReverseBlit);
+    log("  NvAPI_Stereo_ReverseStereoBlitControl: %s",
+        s_fnReverseBlit?"FOUND":"NOT FOUND");
 
     log("  NVAPI init done  handle=%p",(void*)s_hStereo);
     return true;
 }
 
-// Activate stereo – call after FSE is acquired (or re-acquired).
 static void nvapiActivate() {
     if(!s_hStereo) return;
     typedef int(*Pfn)(void*); auto fn=(Pfn)nvQ(NvID_Stereo_Activate);
@@ -457,10 +428,9 @@ static void nvapiShutdown(){
 // Stereo render + restore loop
 // ============================================================================
 static void runStereoLoop() {
-    log("--- D3D11 DIRECT stereo render loop (ESC to quit) ---");
-    log("  Back buffer: %dx%d  Left=[0..%d] CYAN  Right=[%d..%d] RED",
-        s_dispW*2, s_dispH, s_dispW-1, s_dispW, s_dispW*2-1);
-    log("  Alt+Tab / click window to restore FSE+3DV");
+    log("--- D3D11 stereo render loop (ReverseStereoBlitControl) ---");
+    log("  ReverseBlit fn: %s",s_fnReverseBlit?"FOUND – stereo blit active":"NOT FOUND – falling back to plain copy (both eyes same)");
+    log("  Left=CYAN  Right=RED   ESC to quit, Alt+Tab/click to restore");
 
     typedef int(*PfnIA)(void*,unsigned char*); auto fnIA=(PfnIA)nvQ(NvID_Stereo_IsActivated);
     typedef int(*PfnGS)(void*,float*);          auto fnGS=(PfnGS)nvQ(NvID_Stereo_GetSeparation);
@@ -478,51 +448,71 @@ static void runStereoLoop() {
         }
         if(s_quit) break;
 
-        // ── FSE / stereo restore on focus regain ─────────────────────────────
+        // ── FSE / stereo auto-restore ─────────────────────────────────────────
         if(s_restore){
             s_restore=false;
             log("  frame=%-6u  Restoring FSE + 3DV...",frame);
-            // Release back-buffer refs before FSE transition
             safeRelease(s_pEyeRTV[0]); safeRelease(s_pEyeRTV[1]);
             safeRelease(s_pEyeTex[0]); safeRelease(s_pEyeTex[1]);
-            safeRelease(s_pBBTex);
-            // Re-assert FSE
+            safeRelease(s_pStereoSrc); safeRelease(s_pBBTex);
             HRESULT hr=vcall<10>(s_pDXGISC,TRUE,(void*)nullptr);
-            log("  SetFullscreenState(TRUE): hr=0x%x",unsigned(hr));
-            // Resize to double-width (no-op if already correct size)
-            vcall<13>(s_pDXGISC,(UINT)2,(UINT)(s_dispW*2),(UINT)s_dispH,
-                      (int)DFMT_UNKNOWN,(UINT)0);
-            // Rebuild RTV on new back buffer
-            if(!d3d11BuildRTV())
-                log("  WARNING: RTV rebuild failed after restore");
-            // Re-activate stereo
+            log("  SetFullscreenState(TRUE): hr=0x%x",(unsigned)hr);
+            vcall<13>(s_pDXGISC,(UINT)2,(UINT)s_dispW,(UINT)s_dispH,(int)DFMT_UNKNOWN,(UINT)0);
+            if(!d3d11BuildTextures())
+                log("  WARNING: texture rebuild failed");
             nvapiActivate();
             SetForegroundWindow(s_hwnd); BringWindowToTop(s_hwnd);
             log("  Restore complete");
         }
 
-        // ── Render: clear eye textures and copy into double-wide back buffer ───
-        renderEyes();
+        if(!s_pEyeRTV[0]||!s_pEyeRTV[1]||!s_pStereoSrc||!s_pBBTex){
+            Sleep(16); continue;
+        }
+
+        // ── Per-eye clear ─────────────────────────────────────────────────────
+        float cyan[4]={0.f,1.f,1.f,1.f};
+        float red [4]={1.f,0.f,0.f,1.f};
+        vcall<33,void>(s_pD3DCtx,(UINT)1,&s_pEyeRTV[0],(void*)nullptr);
+        vcall<50,void>(s_pD3DCtx,s_pEyeRTV[0],cyan);
+        vcall<33,void>(s_pD3DCtx,(UINT)1,&s_pEyeRTV[1],(void*)nullptr);
+        vcall<50,void>(s_pD3DCtx,s_pEyeRTV[1],red);
+
+        // ── Assemble 2W×H stereo source: eye[0]=left  eye[1]=right ───────────
+        // CopySubresourceRegion (ctx vtable 46):
+        //   (pDst, DstSub, DstX, DstY, DstZ, pSrc, SrcSub, pSrcBox)
+        vcall<46,void>(s_pD3DCtx,
+            s_pStereoSrc, (UINT)0, (UINT)0,       (UINT)0, (UINT)0,
+            s_pEyeTex[0], (UINT)0, (void*)nullptr);
+        vcall<46,void>(s_pD3DCtx,
+            s_pStereoSrc, (UINT)0, (UINT)s_dispW, (UINT)0, (UINT)0,
+            s_pEyeTex[1], (UINT)0, (void*)nullptr);
+
+        // ── Reverse stereo blit: copy 2W×H → W×H back buffer ─────────────────
+        // With ReverseStereoBlitControl enabled, the driver intercepts
+        // CopyResource and routes left half → left eye, right half → right eye.
+        // Without it we fall back to a plain copy (both eyes see left half only).
+        if(s_fnReverseBlit) s_fnReverseBlit(s_hStereo, 1);
+        // CopyResource (ctx vtable 47): (pDst, pSrc)
+        vcall<47,void>(s_pD3DCtx, s_pBBTex, s_pStereoSrc);
+        if(s_fnReverseBlit) s_fnReverseBlit(s_hStereo, 0);
 
         // ── Present ───────────────────────────────────────────────────────────
         HRESULT hr=dxgiPresent(1);
-
         ++frame;
 
-        // ── Activation monitor: re-activate if stereo drops ──────────────────
+        // ── Activation monitor ────────────────────────────────────────────────
         unsigned char active=0;
         if(fnIA) fnIA(s_hStereo,&active);
-        if(active && !wasActivated){
+        if(active&&!wasActivated){
             wasActivated=true;
             log("  frame=%-6u  *** IsActivated 0→1 (3DV live) ***",frame);
         }
-        if(!active && wasActivated){
+        if(!active&&wasActivated){
             wasActivated=false;
             log("  frame=%-6u  IsActivated 1→0 – re-activating",frame);
             if(fnAct) fnAct(s_hStereo);
         }
 
-        // ── Periodic diagnostic ───────────────────────────────────────────────
         if(frame==1||frame%120==0){
             float sep=0.f; if(fnGS) fnGS(s_hStereo,&sep);
             log("  frame=%-6u  present=0x%x  activated=%d  sep=%.1f%%",
@@ -746,37 +736,29 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int){
     AllocConsole();
     FILE *f=nullptr; freopen_s(&f,"CONOUT$","w",stdout);
     logInit();
-    log("=== VkStereo3DVision v15 startup ===");
+    log("=== VkStereo3DVision v16 startup ===");
     logDisplayMode();
 
     s_hwnd=createFullscreenWindow(hInst);
     s_dispW=GetSystemMetrics(SM_CXSCREEN);
     s_dispH=GetSystemMetrics(SM_CYSCREEN);
 
-    // D3D11 device (no swap chain yet)
     bool d3dOk=d3d11InitDevice();
-
-    // NVAPI: enable stereo, create handle, set DIRECT mode
-    // Must happen before swap chain so driver knows this is a stereo process
     bool nvapiOk = d3dOk && nvapiInit(s_pD3DDev);
     bool stereoMode = (s_hStereo != nullptr);
     log("  D3D11=%s  NVAPI=%s  stereoMode=%s",
         d3dOk?"OK":"FAIL", nvapiOk?"OK":"FAIL", stereoMode?"YES":"NO");
 
     if(stereoMode){
-        // Create double-width swap chain
-        bool scOk = d3d11CreateSwapChain(s_hwnd);
-        // Go FSE + build RTV
+        bool scOk  = d3d11CreateSwapChain(s_hwnd);
         bool fseOk = scOk && d3d11GoFSE();
-        // Activate stereo after FSE
         nvapiActivate();
 
         if(!s_pEyeRTV[0]||!s_pEyeRTV[1]){
-            log("FATAL: no RTV");
-            MessageBoxA(nullptr,"D3D11 RTV setup failed","Error",MB_OK|MB_ICONERROR);
+            log("FATAL: texture setup failed");
+            MessageBoxA(nullptr,"D3D11 texture setup failed","Error",MB_OK|MB_ICONERROR);
         } else {
-            // Clear the restore flag that was set during init window messages
-            s_restore=false;
+            s_restore=false;  // clear WM_ACTIVATE from init
             runStereoLoop();
         }
         nvapiShutdown();
