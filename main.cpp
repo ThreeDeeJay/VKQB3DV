@@ -1,5 +1,5 @@
 /*
- * vulkan_stereo_3dvision.cpp  v23
+ * vulkan_stereo_3dvision.cpp  v24
  *
  * Stereoscopic 3D – NVIDIA 3D Vision, driver 426.06 / 452.06.
  *
@@ -108,7 +108,7 @@ static HWND createWindow(HINSTANCE hInst,int w,int h){
     wc.lpfnWndProc=WndProc; wc.hInstance=hInst;
     wc.hCursor=LoadCursorA(nullptr,IDC_ARROW); wc.lpszClassName="VkStereoWnd";
     RegisterClassExA(&wc);
-    HWND hwnd=CreateWindowExA(0,"VkStereoWnd","3D Vision Stereo v23  ESC=quit",
+    HWND hwnd=CreateWindowExA(0,"VkStereoWnd","3D Vision Stereo v24  ESC=quit",
         WS_POPUP,0,0,w,h,nullptr,nullptr,hInst,nullptr);
     ShowWindow(hwnd,SW_SHOW); UpdateWindow(hwnd);
     SetForegroundWindow(hwnd); BringWindowToTop(hwnd);
@@ -260,7 +260,7 @@ static bool d3d11BuildSliceRTVs(){
 }
 
 static void d3d11Shutdown(){
-    if(s_pDXGISC) vcall<10>(s_pDXGISC,FALSE,(void*)nullptr);
+    // No SetFullscreenState(FALSE) needed – we never called SetFullscreenState(TRUE)
     safeRelease(s_pEyeRTV[0]); safeRelease(s_pEyeRTV[1]); safeRelease(s_pBBTex);
     safeRelease(s_pD3DCtx); safeRelease(s_pDXGISC); safeRelease(s_pD3DDev);
     if(s_hD3D11){FreeLibrary(s_hD3D11);s_hD3D11=nullptr;}
@@ -328,15 +328,16 @@ static bool dxgiCreateStereoSwapChain(HWND hwnd){
     return SUCCEEDED(hr)&&s_pDXGISC;
 }
 
-static bool d3d11GoFSE(){
-    log("--- Going fullscreen exclusive ---");
-    safeRelease(s_pEyeRTV[0]); safeRelease(s_pEyeRTV[1]); safeRelease(s_pBBTex);
-    HRESULT hr=vcall<10>(s_pDXGISC,TRUE,(void*)nullptr);
-    log("  SetFullscreenState(TRUE): hr=0x%x (%s)",(unsigned)hr,SUCCEEDED(hr)?"OK":"FAILED");
-    if(FAILED(hr)) return false;
-    // ResizeBuffers to re-confirm the stereo Texture2DArray layout after FSE
-    hr=vcall<13>(s_pDXGISC,(UINT)2,(UINT)s_W,(UINT)s_H,(int)DFMT_UNKNOWN,(UINT)DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH);
-    log("  ResizeBuffers: hr=0x%x (%s)",(unsigned)hr,SUCCEEDED(hr)?"OK":"FAILED");
+// FLIP model swap chains (required for DXGI stereo) do NOT support
+// SetFullscreenState – it returns E_FAIL.  Instead we rely on the OS
+// "fullscreen optimisation" path: a WS_POPUP window covering the full
+// display resolution is automatically promoted to exclusive-like fullscreen
+// by DXGI without an explicit FSE transition.
+// We just build the RTVs directly on the swap chain back buffer.
+static bool d3d11BuildRTVsWindowed(){
+    log("--- Building RTVs (borderless fullscreen – no SetFullscreenState) ---");
+    log("  (FLIP stereo swap chains cannot use SetFullscreenState; WS_POPUP");
+    log("   at full resolution is promoted to fullscreen optimisation path)");
     return d3d11BuildSliceRTVs();
 }
 
@@ -425,12 +426,8 @@ static void runStereoLoop(){
 
         if(s_restore){
             s_restore=false;
-            log("  frame=%-6u  Restoring FSE...",frame);
+            log("  frame=%-6u  Rebuilding RTVs after focus restore...",frame);
             safeRelease(s_pEyeRTV[0]); safeRelease(s_pEyeRTV[1]); safeRelease(s_pBBTex);
-            HRESULT hr=vcall<10>(s_pDXGISC,TRUE,(void*)nullptr);
-            log("  SetFullscreenState(TRUE): hr=0x%x",(unsigned)hr);
-            vcall<13>(s_pDXGISC,(UINT)2,(UINT)s_W,(UINT)s_H,
-                      (int)DFMT_UNKNOWN,(UINT)DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH);
             d3d11BuildSliceRTVs();
             nvapiActivate();
             SetForegroundWindow(s_hwnd); BringWindowToTop(s_hwnd);
@@ -637,7 +634,7 @@ struct VkApp {
 int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR,int){
     AllocConsole(); FILE *f=nullptr; freopen_s(&f,"CONOUT$","w",stdout);
     logInit();
-    log("=== VkStereo3DVision v23 startup ===");
+    log("=== VkStereo3DVision v24 startup ===");
     DEVMODEA dm{}; dm.dmSize=sizeof(dm);
     if(EnumDisplaySettingsA(nullptr,ENUM_CURRENT_SETTINGS,&dm))
         log("  Display: %ux%u @ %u Hz",dm.dmPelsWidth,dm.dmPelsHeight,dm.dmDisplayFrequency);
@@ -659,12 +656,12 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR,int){
     // NVAPI handle for monitoring
     if(scOk) nvapiCreateHandle();
 
-    // FSE + slice RTVs
-    bool fseOk=scOk && d3d11GoFSE();
-    bool stereoOk=fseOk && s_pEyeRTV[0] && s_pEyeRTV[1];
+    // Build RTVs directly (no FSE – FLIP stereo doesn't support SetFullscreenState)
+    bool rtvOk=scOk && d3d11BuildRTVsWindowed();
+    bool stereoOk=rtvOk && s_pEyeRTV[0] && s_pEyeRTV[1];
 
-    log("  d3d=%s  sc=%s  fse=%s  stereo=%s",
-        d3dOk?"OK":"FAIL", scOk?"OK":"FAIL", fseOk?"OK":"FAIL", stereoOk?"YES":"NO");
+    log("  d3d=%s  sc=%s  rtv=%s  stereo=%s",
+        d3dOk?"OK":"FAIL", scOk?"OK":"FAIL", rtvOk?"OK":"FAIL", stereoOk?"YES":"NO");
 
     if(stereoOk){
         nvapiActivate();
