@@ -1,5 +1,5 @@
 /*
- * vulkan_stereo_3dvision.cpp  v24
+ * vulkan_stereo_3dvision.cpp  v25
  *
  * Stereoscopic 3D – NVIDIA 3D Vision, driver 426.06 / 452.06.
  *
@@ -108,7 +108,7 @@ static HWND createWindow(HINSTANCE hInst,int w,int h){
     wc.lpfnWndProc=WndProc; wc.hInstance=hInst;
     wc.hCursor=LoadCursorA(nullptr,IDC_ARROW); wc.lpszClassName="VkStereoWnd";
     RegisterClassExA(&wc);
-    HWND hwnd=CreateWindowExA(0,"VkStereoWnd","3D Vision Stereo v24  ESC=quit",
+    HWND hwnd=CreateWindowExA(0,"VkStereoWnd","3D Vision Stereo v25  ESC=quit",
         WS_POPUP,0,0,w,h,nullptr,nullptr,hInst,nullptr);
     ShowWindow(hwnd,SW_SHOW); UpdateWindow(hwnd);
     SetForegroundWindow(hwnd); BringWindowToTop(hwnd);
@@ -296,7 +296,12 @@ static bool dxgiCreateStereoSwapChain(HWND hwnd){
     BOOL wse=vcall<14,BOOL>(pFact2);
     log("  IsWindowedStereoEnabled = %s",wse?"TRUE":"FALSE");
 
-    // Build DXGI_SWAP_CHAIN_DESC1 with Stereo=TRUE
+    // IsWindowedStereoEnabled=FALSE on this driver – stereo Texture2DArray is only
+    // allocated when the swap chain is created in exclusive fullscreen mode.
+    // FLIP swap chains cannot use SetFullscreenState after creation, but
+    // CreateSwapChainForHwnd accepts a pFullscreenDesc (DXGI_SC_FULLSCREEN_DESC)
+    // with Windowed=FALSE to request exclusive fullscreen at creation time.
+    // This is the correct path for FLIP+stereo+FSE on 3D Vision drivers.
     DXGI_SWAP_CHAIN_DESC1_ scd1{};
     scd1.Width       = (UINT)s_W;
     scd1.Height      = (UINT)s_H;
@@ -306,22 +311,25 @@ static bool dxgiCreateStereoSwapChain(HWND hwnd){
     scd1.BufferUsage = DXGI_USAGE_RTO;
     scd1.BufferCount = 2;
     scd1.Scaling     = DSCALE_NONE;
-    scd1.SwapEffect  = DSE_FLIP_DISCARD;  // FLIP_DISCARD required for stereo
+    scd1.SwapEffect  = DSE_FLIP_DISCARD;
     scd1.AlphaMode   = DALPHA_UNSPEC;
     scd1.Flags       = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
 
+    // pFullscreenDesc with Windowed=FALSE → request exclusive fullscreen at creation
+    DXGI_SC_FULLSCREEN_DESC_ fsd{};
+    fsd.RefreshRate = {120,1};
+    fsd.Windowed    = FALSE;  // exclusive fullscreen
+
     // IDXGIFactory2::CreateSwapChainForHwnd (vtable 15)
-    // Args: pDevice, hWnd, pDesc, pFullscreenDesc(nullptr=windowed), pOutput(nullptr), **ppSwapChain
-    hr=vcall<15>(pFact2,s_pD3DDev,(UINT_PTR)hwnd,&scd1,(void*)nullptr,(void*)nullptr,&s_pDXGISC);
-    log("  CreateSwapChainForHwnd(Stereo=TRUE): hr=0x%x (%s)  sc=%p",
+    hr=vcall<15>(pFact2,s_pD3DDev,(UINT_PTR)hwnd,&scd1,&fsd,(void*)nullptr,&s_pDXGISC);
+    log("  CreateSwapChainForHwnd(Stereo=TRUE,FSE): hr=0x%x (%s)  sc=%p",
         (unsigned)hr,SUCCEEDED(hr)?"OK":"FAILED",(void*)s_pDXGISC);
 
     if(FAILED(hr)||!s_pDXGISC){
-        // Fallback: try without FLIP_DISCARD (some drivers require DISCARD for stereo)
-        log("  Retrying with SwapEffect=DISCARD...");
-        scd1.SwapEffect=DSE_DISCARD;
+        // Fallback: windowed (stereo may still work if driver changed its mind)
+        log("  FSE failed – retrying windowed...");
         hr=vcall<15>(pFact2,s_pD3DDev,(UINT_PTR)hwnd,&scd1,(void*)nullptr,(void*)nullptr,&s_pDXGISC);
-        log("  Retry hr=0x%x (%s)  sc=%p",(unsigned)hr,SUCCEEDED(hr)?"OK":"FAILED",(void*)s_pDXGISC);
+        log("  Windowed retry: hr=0x%x (%s)  sc=%p",(unsigned)hr,SUCCEEDED(hr)?"OK":"FAILED",(void*)s_pDXGISC);
     }
 
     pFact2->Release();
@@ -335,9 +343,9 @@ static bool dxgiCreateStereoSwapChain(HWND hwnd){
 // by DXGI without an explicit FSE transition.
 // We just build the RTVs directly on the swap chain back buffer.
 static bool d3d11BuildRTVsWindowed(){
-    log("--- Building RTVs (borderless fullscreen – no SetFullscreenState) ---");
-    log("  (FLIP stereo swap chains cannot use SetFullscreenState; WS_POPUP");
-    log("   at full resolution is promoted to fullscreen optimisation path)");
+    log("--- Building RTVs (FLIP stereo swap chain, FSE via pFullscreenDesc) ---");
+    log("  (pFullscreenDesc Windowed=FALSE requests FSE at creation time)");
+    log("  (no SetFullscreenState call needed or supported with FLIP chains)");
     return d3d11BuildSliceRTVs();
 }
 
@@ -634,7 +642,7 @@ struct VkApp {
 int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR,int){
     AllocConsole(); FILE *f=nullptr; freopen_s(&f,"CONOUT$","w",stdout);
     logInit();
-    log("=== VkStereo3DVision v24 startup ===");
+    log("=== VkStereo3DVision v25 startup ===");
     DEVMODEA dm{}; dm.dmSize=sizeof(dm);
     if(EnumDisplaySettingsA(nullptr,ENUM_CURRENT_SETTINGS,&dm))
         log("  Display: %ux%u @ %u Hz",dm.dmPelsWidth,dm.dmPelsHeight,dm.dmDisplayFrequency);
