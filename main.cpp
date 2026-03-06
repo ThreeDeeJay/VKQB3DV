@@ -1,5 +1,5 @@
 /*
- * vulkan_stereo_3dvision.cpp  v22
+ * vulkan_stereo_3dvision.cpp  v23
  *
  * Stereoscopic 3D – NVIDIA 3D Vision, driver 426.06 / 452.06.
  *
@@ -108,7 +108,7 @@ static HWND createWindow(HINSTANCE hInst,int w,int h){
     wc.lpfnWndProc=WndProc; wc.hInstance=hInst;
     wc.hCursor=LoadCursorA(nullptr,IDC_ARROW); wc.lpszClassName="VkStereoWnd";
     RegisterClassExA(&wc);
-    HWND hwnd=CreateWindowExA(0,"VkStereoWnd","3D Vision Stereo v22  ESC=quit",
+    HWND hwnd=CreateWindowExA(0,"VkStereoWnd","3D Vision Stereo v23  ESC=quit",
         WS_POPUP,0,0,w,h,nullptr,nullptr,hInst,nullptr);
     ShowWindow(hwnd,SW_SHOW); UpdateWindow(hwnd);
     SetForegroundWindow(hwnd); BringWindowToTop(hwnd);
@@ -195,8 +195,8 @@ static R vcall(void *o,A...args){
 //   IDXGIAdapter:          (inherits IDXGIObject, GetParent=6)
 //   IDXGIFactory:          10=CreateSwapChain
 //   IDXGIFactory1:         13=EnumAdapters1  14=IsCurrent
-//   IDXGIFactory2:         15=IsWindowedStereoEnabled
-//                          16=CreateSwapChainForHwnd
+//   IDXGIFactory2:         14=IsWindowedStereoEnabled
+//                          15=CreateSwapChainForHwnd
 //   IDXGISwapChain:        8=Present 9=GetBuffer 10=SetFullscreenState
 //                          11=GetFullscreenState 12=GetDesc 13=ResizeBuffers
 //   ID3D11Device:          5=CreateTexture2D 9=CreateRenderTargetView
@@ -291,9 +291,9 @@ static bool dxgiCreateStereoSwapChain(HWND hwnd){
     log("  GetParent IDXGIFactory2: hr=0x%x  ptr=%p",(unsigned)hr,(void*)pFact2);
     if(FAILED(hr)||!pFact2) return false;
 
-    // IDXGIFactory2::IsWindowedStereoEnabled (vtable 15)
+    // IDXGIFactory2::IsWindowedStereoEnabled (vtable 14)
     // Returns TRUE if the display supports stereo in windowed mode
-    BOOL wse=vcall<15,BOOL>(pFact2);
+    BOOL wse=vcall<14,BOOL>(pFact2);
     log("  IsWindowedStereoEnabled = %s",wse?"TRUE":"FALSE");
 
     // Build DXGI_SWAP_CHAIN_DESC1 with Stereo=TRUE
@@ -310,9 +310,9 @@ static bool dxgiCreateStereoSwapChain(HWND hwnd){
     scd1.AlphaMode   = DALPHA_UNSPEC;
     scd1.Flags       = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
 
-    // IDXGIFactory2::CreateSwapChainForHwnd (vtable 16)
+    // IDXGIFactory2::CreateSwapChainForHwnd (vtable 15)
     // Args: pDevice, hWnd, pDesc, pFullscreenDesc(nullptr=windowed), pOutput(nullptr), **ppSwapChain
-    hr=vcall<16>(pFact2,s_pD3DDev,(UINT_PTR)hwnd,&scd1,(void*)nullptr,(void*)nullptr,&s_pDXGISC);
+    hr=vcall<15>(pFact2,s_pD3DDev,(UINT_PTR)hwnd,&scd1,(void*)nullptr,(void*)nullptr,&s_pDXGISC);
     log("  CreateSwapChainForHwnd(Stereo=TRUE): hr=0x%x (%s)  sc=%p",
         (unsigned)hr,SUCCEEDED(hr)?"OK":"FAILED",(void*)s_pDXGISC);
 
@@ -320,7 +320,7 @@ static bool dxgiCreateStereoSwapChain(HWND hwnd){
         // Fallback: try without FLIP_DISCARD (some drivers require DISCARD for stereo)
         log("  Retrying with SwapEffect=DISCARD...");
         scd1.SwapEffect=DSE_DISCARD;
-        hr=vcall<16>(pFact2,s_pD3DDev,(UINT_PTR)hwnd,&scd1,(void*)nullptr,(void*)nullptr,&s_pDXGISC);
+        hr=vcall<15>(pFact2,s_pD3DDev,(UINT_PTR)hwnd,&scd1,(void*)nullptr,(void*)nullptr,&s_pDXGISC);
         log("  Retry hr=0x%x (%s)  sc=%p",(unsigned)hr,SUCCEEDED(hr)?"OK":"FAILED",(void*)s_pDXGISC);
     }
 
@@ -637,7 +637,7 @@ struct VkApp {
 int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR,int){
     AllocConsole(); FILE *f=nullptr; freopen_s(&f,"CONOUT$","w",stdout);
     logInit();
-    log("=== VkStereo3DVision v22 startup ===");
+    log("=== VkStereo3DVision v23 startup ===");
     DEVMODEA dm{}; dm.dmSize=sizeof(dm);
     if(EnumDisplaySettingsA(nullptr,ENUM_CURRENT_SETTINGS,&dm))
         log("  Display: %ux%u @ %u Hz",dm.dmPelsWidth,dm.dmPelsHeight,dm.dmDisplayFrequency);
