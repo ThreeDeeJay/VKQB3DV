@@ -1,5 +1,5 @@
 /*
- * vulkan_stereo_3dvision.cpp  v26
+ * vulkan_stereo_3dvision.cpp  v27
  *
  * Stereoscopic 3D – NVIDIA 3D Vision, driver 426.06 / 452.06.
  *
@@ -108,7 +108,7 @@ static HWND createWindow(HINSTANCE hInst,int w,int h){
     wc.lpfnWndProc=WndProc; wc.hInstance=hInst;
     wc.hCursor=LoadCursorA(nullptr,IDC_ARROW); wc.lpszClassName="VkStereoWnd";
     RegisterClassExA(&wc);
-    HWND hwnd=CreateWindowExA(0,"VkStereoWnd","3D Vision Stereo v26  ESC=quit",
+    HWND hwnd=CreateWindowExA(0,"VkStereoWnd","3D Vision Stereo v27  ESC=quit",
         WS_POPUP,0,0,w,h,nullptr,nullptr,hInst,nullptr);
     ShowWindow(hwnd,SW_SHOW); UpdateWindow(hwnd);
     SetForegroundWindow(hwnd); BringWindowToTop(hwnd);
@@ -439,8 +439,13 @@ static void runStereoLoop(){
 
         if(s_restore){
             s_restore=false;
-            log("  frame=%-6u  Rebuilding RTVs after focus restore...",frame);
+            log("  frame=%-6u  Restoring after focus change...",frame);
             safeRelease(s_pEyeRTV[0]); safeRelease(s_pEyeRTV[1]); safeRelease(s_pBBTex);
+            // ResizeBuffers re-syncs the back buffer after FSE transitions
+            // (required because the back buffer pointer changes when DXGI takes/gives up FSE)
+            HRESULT hrRsz=vcall<13>(s_pDXGISC,(UINT)0,(UINT)0,(UINT)0,
+                                    (int)DFMT_UNKNOWN,(UINT)DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH);
+            log("  ResizeBuffers(0,0,0): hr=0x%x",(unsigned)hrRsz);
             d3d11BuildSliceRTVs();
             nvapiActivate();
             SetForegroundWindow(s_hwnd); BringWindowToTop(s_hwnd);
@@ -460,6 +465,14 @@ static void runStereoLoop(){
 
         HRESULT hr=dxgiPresent(1);
         ++frame;
+
+        // 0x887A0001 = DXGI_STATUS_OCCLUDED: swap chain lost exclusive access
+        // (Alt+Tab, minimize, another app went FSE). Sleep and skip rendering
+        // until DXGI restores access. WM_ACTIVATE will set s_restore when focus returns.
+        if(hr==0x887A0001){
+            if(frame%600==1) log("  frame=%-6u  OCCLUDED (0x887A0001) – waiting for focus",frame);
+            Sleep(33); continue;
+        }
 
         unsigned char active=0;
         if(fnIA) fnIA(s_hStereo,&active);
@@ -647,7 +660,7 @@ struct VkApp {
 int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR,int){
     AllocConsole(); FILE *f=nullptr; freopen_s(&f,"CONOUT$","w",stdout);
     logInit();
-    log("=== VkStereo3DVision v26 startup ===");
+    log("=== VkStereo3DVision v27 startup ===");
     DEVMODEA dm{}; dm.dmSize=sizeof(dm);
     if(EnumDisplaySettingsA(nullptr,ENUM_CURRENT_SETTINGS,&dm))
         log("  Display: %ux%u @ %u Hz",dm.dmPelsWidth,dm.dmPelsHeight,dm.dmDisplayFrequency);
