@@ -1,5 +1,5 @@
 /*
- * vulkan_stereo_3dvision.cpp  v25
+ * vulkan_stereo_3dvision.cpp  v26
  *
  * Stereoscopic 3D – NVIDIA 3D Vision, driver 426.06 / 452.06.
  *
@@ -108,7 +108,7 @@ static HWND createWindow(HINSTANCE hInst,int w,int h){
     wc.lpfnWndProc=WndProc; wc.hInstance=hInst;
     wc.hCursor=LoadCursorA(nullptr,IDC_ARROW); wc.lpszClassName="VkStereoWnd";
     RegisterClassExA(&wc);
-    HWND hwnd=CreateWindowExA(0,"VkStereoWnd","3D Vision Stereo v25  ESC=quit",
+    HWND hwnd=CreateWindowExA(0,"VkStereoWnd","3D Vision Stereo v26  ESC=quit",
         WS_POPUP,0,0,w,h,nullptr,nullptr,hInst,nullptr);
     ShowWindow(hwnd,SW_SHOW); UpdateWindow(hwnd);
     SetForegroundWindow(hwnd); BringWindowToTop(hwnd);
@@ -156,10 +156,11 @@ typedef struct {
 
 // D3D11_RENDER_TARGET_VIEW_DESC for Texture2DArray
 // ViewDimension: TEXTURE2D=4  TEXTURE2DARRAY=5
+// Fixed: no _pad. Real layout: Format(4) ViewDimension(4) MipSlice(4) FirstArraySlice(4) ArraySize(4)
+// _pad caused driver to read ArraySize=0 -> E_INVALIDARG on every RTV creation
 typedef struct {
     DXGI_FORMAT_ Format;
     UINT         ViewDimension;
-    UINT         _pad;           // union padding to reach Texture2DArray fields
     UINT         MipSlice;
     UINT         FirstArraySlice;
     UINT         ArraySize;
@@ -238,12 +239,16 @@ static bool d3d11BuildSliceRTVs(){
     HRESULT hr=vcall<9>(s_pDXGISC,(UINT)0,&s_iidTex2D,(void**)&s_pBBTex);
     log("  GetBuffer: hr=0x%x  tex=%p",(unsigned)hr,(void*)s_pBBTex);
     if(FAILED(hr)||!s_pBBTex) return false;
+    D3D11_TEX2D_DESC_ bbDesc{};
+    vcall<10,void>(s_pBBTex,&bbDesc);
+    log("  BB: %ux%u ArraySize=%u Format=%u",bbDesc.Width,bbDesc.Height,bbDesc.ArraySize,(unsigned)bbDesc.Format);
+    if(bbDesc.ArraySize<2) log("  WARNING: mono back buffer – stereo flag not honoured");
+    else log("  ArraySize=2 – stereo Texture2DArray confirmed");
 
     for(UINT slice=0;slice<2;++slice){
         D3D11_RTV_DESC_Tex2DArray_ desc{};
         desc.Format        = DFMT_B8G8R8A8;
         desc.ViewDimension = 5;          // D3D11_RTV_DIMENSION_TEXTURE2DARRAY
-        desc._pad          = 0;
         desc.MipSlice      = 0;
         desc.FirstArraySlice = slice;
         desc.ArraySize       = 1;
@@ -642,7 +647,7 @@ struct VkApp {
 int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR,int){
     AllocConsole(); FILE *f=nullptr; freopen_s(&f,"CONOUT$","w",stdout);
     logInit();
-    log("=== VkStereo3DVision v25 startup ===");
+    log("=== VkStereo3DVision v26 startup ===");
     DEVMODEA dm{}; dm.dmSize=sizeof(dm);
     if(EnumDisplaySettingsA(nullptr,ENUM_CURRENT_SETTINGS,&dm))
         log("  Display: %ux%u @ %u Hz",dm.dmPelsWidth,dm.dmPelsHeight,dm.dmDisplayFrequency);
